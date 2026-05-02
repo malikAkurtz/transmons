@@ -1,0 +1,8 @@
+import numpy as np
+from constants import REDUCED_FLUX_QUANTUM
+
+NUM_KICKS = 150
+SIGMA = 1.7e-11
+AMPLITUDE_SCALE = REDUCED_FLUX_QUANTUM / (SIGMA * np.sqrt(2 * np.pi))
+DETUNING = 0
+STEPS_PER_PERIOD = 200
