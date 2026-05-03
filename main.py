@@ -26,7 +26,7 @@ from config import NUM_KICKS, AMPLITUDE_SCALE, DETUNING, STEPS_PER_PERIOD, SIGMA
 from Node import Node
 from DCSQUID import DCSQUID
 from Transmon import Transmon
-from Quantize import quantize_transmon
+from Quantize import quantize
 from CrankNicolson import CrankNicolsonSolver
 from Wavefunction import Wavefunction
 from utils import create_gaussian_sfq_pulses
@@ -83,10 +83,17 @@ def main():
         external_flux=external_flux
     )
     print(f"EC = {EC}  EJ = {EJ}  EJ/EC = {EJ/EC}")
+    
+    print("Hamiltonian: ")
+    print(transmon.hamiltonian(external_flux))
 
     # ---- Quantize ----
-    system = quantize_transmon(transmon=transmon, external_flux=external_flux, n_charge=n_charge)
-
+    system = quantize(
+        circuit=transmon, 
+        external_flux=external_flux, 
+        n_charge=n_charge
+    )
+    
     # Qubit transition frequency f_01 and anharmonicity alpha extracted
     # from the lowest three energy eigenvalues.
     f_01     = (system.H0["energy"][1][1] - system.H0["energy"][0][0]) / h

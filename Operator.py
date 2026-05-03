@@ -13,6 +13,8 @@ mix operators across bases with explicit, readable indexing
 (``op["energy"]``).
 """
 
+from __future__ import annotations
+
 import numpy as np
 
 
@@ -45,3 +47,26 @@ class Operator():
     def __setitem__(self, basis: str, matrix: np.ndarray) -> None:
         """Store a new basis representation of the operator."""
         self._basis_to_matrix[basis] = matrix
+        
+    def __add__(self, other: Operator):
+        new_op = Operator({})
+        
+        for basis, matrix in self._basis_to_matrix.items():
+            new_op[basis] = self[basis] + other[basis]
+        
+        return new_op
+    
+    def __mul__(self, other: Operator | float):
+        new_op = Operator({})
+        
+        if isinstance(other, Operator):
+            for basis, matrix in self._basis_to_matrix.items():
+                new_op[basis] = self[basis] @ other[basis]
+        else:
+            for basis, matrix in self._basis_to_matrix.items():
+                new_op[basis] = self[basis] * other
+        
+        return new_op
+        
+        
+            

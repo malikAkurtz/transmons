@@ -20,6 +20,8 @@ from Circuit import Circuit
 from DCSQUID import DCSQUID
 from Branch import Capacitor
 from Graph import Multidigraph
+from constants import e
+from Expression import *
 
 
 class Transmon(Circuit):
@@ -61,5 +63,17 @@ class Transmon(Circuit):
             s=dcsquid.s + [self.dcsquid.gnd._id] * 2,
             t=dcsquid.t + [self.dcsquid.island._id] * 2
         )
+        
+        self.total_capacitance = np.array([b.capacitance for b in graph.branches if isinstance(b, Capacitor)]).sum()
+        
+        self.charging_energy = (e**2) / (2 * self.total_capacitance)
 
         super().__init__(graph)
+        
+    def hamiltonian(self, external_flux: float):
+        EJ = DCSQUID.calculate_effective_josephson_energy(
+            left_josephson_energy=self.dcsquid.left_josephson_energy,
+            right_josephson_energy=self.dcsquid.right_josephson_energy,
+            external_flux=external_flux
+        )
+        return Scalar(4) * Scalar(self.charging_energy) * ( Op("n")**Scalar(2) ) + Scalar(-EJ) * Cos(Op("phi"))

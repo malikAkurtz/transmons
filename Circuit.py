@@ -152,6 +152,9 @@ class Circuit():
         self._partition_nodes()
         self.P = len(self.active_nodes) + len(self.passive_nodes) + 1
         self._build_matrices()
+        
+    def hamiltonian(self):
+        pass
 
 
     def __str__(self):
