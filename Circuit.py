@@ -81,26 +81,25 @@ class Circuit():
         self.passive_nodes = []
 
         for node in self.nodes:
-            node_id = node._id
-
             # Skip ground; it is treated separately and removed at the end.
-            if node_id == 0:
+            if node._id == 0:
                 continue
 
             for branch in self.branches:
                 # A node is classified the first time we encounter an
                 # incident branch; later branches on the same node are
                 # ignored.
-                if node_id in self.active_nodes or node_id in self.passive_nodes:
+                if node in self.active_nodes or node in self.passive_nodes:
                     continue
-                if not node_id in [self.s[branch._id], self.t[branch._id]]:
+                
+                if not node in [self.s(branch), self.t(branch)]:
                     continue
 
                 # A node attached to *any* inductive element is active.
                 if isinstance(branch, Inductor) or isinstance(branch, JosephsonElement):
-                    self.active_nodes.append(node_id)
+                    self.active_nodes.append(node)
                 else:
-                    self.passive_nodes.append(node_id)
+                    self.passive_nodes.append(node)
 
 
     def _build_matrices(self):
@@ -121,16 +120,30 @@ class Circuit():
 
         # Off-diagonal entries: accumulate -C and -1/L for every branch
         # whose endpoints are {i, j}.
+        
+        for branch in self.branches:
+            source_node   = self.s(branch)
+            terminal_node = self.t(branch)
+            
+            source_node_idx   = self.node_to_idx[source_node]
+            terminal_node_idx = self.node_to_idx[terminal_node]
+            
+            if isinstance(branch, Capacitor):
+                self.capacitance_matrix[source_node_idx][terminal_node_idx] -= branch.capacitance
+            elif isinstance(branch, Inductor):
+                self.inv_inductance_matrix -= (1/branch.inductance)
+        
+        
         for i in range(self.P):
             for j in range(self.P):
+                # we populate the diagonals later
                 if i == j:
                     continue
+                
                 for branch in self.branches:
-                    if set([i, j]) == set([self.s[branch._id], self.t[branch._id]]):
-                        if isinstance(branch, Capacitor):
-                            self.capacitance_matrix[i][j] -= branch.capacitance
-                        elif isinstance(branch, Inductor):
-                            self.inv_inductance_matrix -= (1/branch.inductance)
+                    if set([i, j]) == set():
+                        
+                        
 
         # Diagonal entries: enforce row-sum = 0 (i.e. each node's self-term
         # equals the sum of magnitudes of its connections).
@@ -153,6 +166,7 @@ class Circuit():
         """
         self._partition_nodes()
         self.P                      = len(self.active_nodes) + len(self.passive_nodes) + 1
+        self.node_to_idx            = {node: i for i, node in enumerate(self.nodes)}
         self._build_matrices()
         self.inv_capacitance_matrix = np.linalg.inv(self.capacitance_matrix)
         self.charging_energy_matrix = ((e**2) / 2) * self.inv_capacitance_matrix

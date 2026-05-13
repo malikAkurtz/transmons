@@ -41,7 +41,7 @@ class Multidigraph():
     symmetric two-terminal quantities.
     """
 
-    def __init__(self, nodes: list[Node], branches: list[Branch], s: list[int], t: list[int]):
+    def __init__(self, nodes: list[Node], branches: list[Branch], s: callable, t: callable):
         self.nodes = nodes
         self.branches = branches
         self.s = s
