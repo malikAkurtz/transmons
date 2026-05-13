@@ -26,6 +26,7 @@ from config import NUM_KICKS, AMPLITUDE_SCALE, DETUNING, STEPS_PER_PERIOD, SIGMA
 from Node import Node
 from DCSQUID import DCSQUID
 from Transmon import Transmon
+from System import System
 from Quantize import quantize
 from CrankNicolson import CrankNicolsonSolver
 from Wavefunction import Wavefunction
@@ -37,7 +38,8 @@ def main():
     # ------------------------ Hyperparameters ------------------------
     # Charge basis size; states run from -(n-1)/2 to +(n-1)/2.  Must be
     # odd so the basis is symmetric around zero.
-    n_charge = 201
+    n_charge = 101
+    n_trunc  = n_charge
 
     # SQUID + drive parameters.
     external_flux        = 0.130 * REDUCED_FLUX_QUANTUM
@@ -51,9 +53,10 @@ def main():
     right_jj_capacitance   = 0
     right_josephson_energy = 21e-9 * REDUCED_FLUX_QUANTUM  # [J]
 
-    # ---- Build circuit ----
+    # ---- Build Ground Node ----
     gnd = Node()
 
+    # ---- Build DCSQUID Circuit Object ----
     dcsquid = DCSQUID(
         ground_node=gnd,
         left_jj_capacitance=left_jj_capacitance,
@@ -61,45 +64,58 @@ def main():
         right_jj_capacitance=right_jj_capacitance,
         right_josephson_energy=right_josephson_energy
     )
-
+    
+    # ---- Build Transmon Circuit Object ----
     transmon = Transmon(
         dcsquid=dcsquid,
         shunt_capacitance=shunt_capacitance,
         coupling_capacitance=coupling_capacitance
     )
-    print("Transmon Circuit Representation")
-    print(transmon)
 
+    # ---- Partition Circuit Nodes and Build Capacitance/Inverse Inductance Matrices
     transmon.build()
+    
     print("Capacitance Matrix [fF]:")
     print(transmon.capacitance_matrix * 1e15)
-
-    # Charging energy E_C and effective Josephson energy E_J for the
-    # current flux bias; the ratio sets the transmon regime.
-    EC = e**2 / (2 * transmon.capacitance_matrix[0][0])
+    
+    # ---- Retrieve Transmon Charging Energy ----
+    EC = transmon.charging_energy
+    
+    # ---- Retrieve Transmon Josephson Energy (From DCSQUID) ----
     EJ = DCSQUID.calculate_effective_josephson_energy(
         left_josephson_energy=left_josephson_energy,
         right_josephson_energy=right_josephson_energy,
         external_flux=external_flux
     )
+
     print(f"EC = {EC}  EJ = {EJ}  EJ/EC = {EJ/EC}")
-    
-    print("Hamiltonian: ")
-    print(transmon.hamiltonian(external_flux))
 
     # ---- Quantize ----
-    system = quantize(
+    transmon_subsystem = quantize(
         circuit=transmon, 
         external_flux=external_flux, 
-        n_charge=n_charge
+        n_charge=n_charge,
     )
     
-    # Qubit transition frequency f_01 and anharmonicity alpha extracted
-    # from the lowest three energy eigenvalues.
-    f_01     = (system.H0["energy"][1][1] - system.H0["energy"][0][0]) / h
+    system = System(
+        circuit=transmon,
+        subsystems=[transmon_subsystem],
+        n_charge=n_charge,
+        n_trunc=n_trunc
+    )
+    
+    print("Idling Hamiltonian: ")
+    print(system.hamiltonian(external_flux))
+    
+    # ---- Qubit Frequency ----
+    f_01 = (transmon_subsystem.H0["energy"][1][1] - transmon_subsystem.H0["energy"][0][0]) / h
+    
+    # ---- Qubit Angular Frequency ----
     omega_01 = 2 * np.pi * f_01
-    alpha    = (system.H0["energy"][2][2] - system.H0["energy"][1][1]) \
-             - (system.H0["energy"][1][1] - system.H0["energy"][0][0])
+    
+    # ---- System Anharmonicity ----
+    alpha    = (transmon_subsystem.H0["energy"][2][2] - transmon_subsystem.H0["energy"][1][1]) \
+             - (transmon_subsystem.H0["energy"][1][1] - transmon_subsystem.H0["energy"][0][0])
     print(f"f_01 = {f_01/1e9:.4f} GHz  |  alpha = {alpha/h/1e6:.2f} MHz")
 
     # ---- Drive ----
@@ -124,7 +140,8 @@ def main():
         system=system,
         initial_state=initial_state,
         external_voltage=external_voltage,
-        time=time
+        time=time,
+        k=0
     )
 
     # ---- Plot ground / first / second level populations vs time ----

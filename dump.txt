@@ -1,0 +1,2051 @@
+================ ./Branch.py ================
+"""
+Branch primitives for the circuit graph.
+
+A *branch* is a two-terminal lumped element that connects two
+:class:`~Node.Node` objects in the circuit.  Three concrete element types are
+supported:
+
+* :class:`Capacitor`         — linear capacitor with capacitance ``C`` [F]
+* :class:`Inductor`          — linear inductor  with inductance  ``L`` [H]
+* :class:`JosephsonElement`  — non-linear Josephson element parameterised by
+  its Josephson energy ``E_J`` [J]
+
+Every branch is given a globally unique integer id (``_id``).  The id is used
+as an index into the source/target arrays of the enclosing
+:class:`~Graph.Multidigraph`, so branches must be created via the subclasses
+below rather than the bare :class:`Branch` base.
+"""
+
+
+class Branch():
+    """Abstract base class for all circuit branches.
+
+    Notes
+    -----
+    Concrete subclasses are expected to assign ``self._id`` from the
+    class-level ``global_id`` counter and to increment it.  The base class
+    itself does not allocate an id (it is only used as a type marker and
+    common ancestor).
+    """
+
+    # Class-level counter shared across every Branch subclass; used to
+    # produce unique ids for every element added to a circuit.
+    global_id = 0
+
+    def __init__(self):
+        pass
+
+
+class Capacitor(Branch):
+    """Linear capacitor branch.
+
+    Parameters
+    ----------
+    capacitance : float
+        Capacitance in Farads.
+    """
+
+    def __init__(self, capacitance: float):
+        self._id = Branch.global_id
+        Branch.global_id += 1
+
+        self.capacitance = capacitance
+
+
+class Inductor(Branch):
+    """Linear (geometric) inductor branch.
+
+    Parameters
+    ----------
+    inductance : float
+        Inductance in Henries.
+    """
+
+    def __init__(self, inductance: float):
+        self._id = Branch.global_id
+        Branch.global_id += 1
+
+        self.inductance = inductance
+
+
+class JosephsonElement(Branch):
+    """Non-linear Josephson element.
+
+    Models the cosine potential of a Josephson junction; the geometric
+    capacitance of the junction (if any) is represented separately by a
+    sibling :class:`Capacitor` branch on the same pair of nodes.
+
+    Parameters
+    ----------
+    josephson_energy : float
+        Josephson energy ``E_J`` in Joules.
+    """
+
+    def __init__(self, josephson_energy: float):
+        self._id = Branch.global_id
+        Branch.global_id += 1
+
+        self.josephson_energy = josephson_energy
+
+
+
+================ ./Circuit.py ================
+"""
+Generic lumped-element circuit assembled from a :class:`~Graph.Multidigraph`.
+
+Given a topology (nodes + branches + source/target maps), :class:`Circuit`
+builds the two reduced linear-algebra objects needed for canonical
+quantisation of LC-like circuits:
+
+* the **reduced capacitance matrix** ``C``  (with the ground row/column
+  removed), and
+* the **reduced inverse-inductance matrix** ``L^{-1}``.
+
+The Josephson cosine potential is *not* part of the linear matrices; it is
+applied later during quantisation (see :mod:`Quantize`).
+
+Node partitioning
+-----------------
+Nodes are split into:
+
+* *active* nodes — connected to at least one inductive element
+  (:class:`~Branch.Inductor` or :class:`~Branch.JosephsonElement`).  These
+  carry a flux degree of freedom.
+* *passive* nodes — connected only to capacitors.  These can in principle
+  be eliminated by Schur complement (the current code keeps them in the
+  matrix and lets the quantisation step handle the size).
+
+The ground node (id ``0``) is always present and is removed from the final
+matrices.
+"""
+
+import numpy as np
+
+from Graph import Multidigraph
+from Branch import Capacitor, Inductor, JosephsonElement
+from constants import e
+
+class Circuit():
+    """A lumped-element circuit built from a topology graph.
+
+    Parameters
+    ----------
+    graph : Multidigraph
+        Topology of the circuit (nodes, branches, and source/target maps).
+
+    Attributes
+    ----------
+    nodes, branches, s, t
+        Mirrors of the corresponding fields on ``graph``.
+    active_nodes, passive_nodes : list[int]
+        Populated by :meth:`build`; ids of inductively-connected nodes vs
+        purely capacitive nodes (excluding ground).
+    P : int
+        Total node count including ground.  Set in :meth:`build`.
+    capacitance_matrix : np.ndarray
+        ``(P-1) x (P-1)`` reduced capacitance matrix in Farads, with the
+        ground row/column removed.
+    inv_inductance_matrix : np.ndarray
+        ``(P-1) x (P-1)`` reduced inverse-inductance matrix in Henries^-1,
+        with the ground row/column removed.
+    """
+
+    def __init__(self, graph: Multidigraph):
+        self.nodes    = graph.nodes
+        self.branches = graph.branches
+        self.s        = graph.s
+        self.t        = graph.t
+
+        self.active_nodes, self.passive_nodes               = None, None
+        self.P                                              = None
+        self.capacitance_matrix, self.inv_inductance_matrix = None, None
+        self.inv_capacitance_matrix                         = None
+        self.charging_energy_matrix                         = None
+
+    def _partition_nodes(self):
+        """Classify each non-ground node as *active* or *passive*.
+
+        A node is *active* if at least one of its incident branches is an
+        :class:`~Branch.Inductor` or :class:`~Branch.JosephsonElement`;
+        otherwise it is *passive*.  Ground (id 0) is excluded.
+        """
+        self.active_nodes  = []
+        self.passive_nodes = []
+
+        for node in self.nodes:
+            node_id = node._id
+
+            # Skip ground; it is treated separately and removed at the end.
+            if node_id == 0:
+                continue
+
+            for branch in self.branches:
+                # A node is classified the first time we encounter an
+                # incident branch; later branches on the same node are
+                # ignored.
+                if node_id in self.active_nodes or node_id in self.passive_nodes:
+                    continue
+                if not node_id in [self.s[branch._id], self.t[branch._id]]:
+                    continue
+
+                # A node attached to *any* inductive element is active.
+                if isinstance(branch, Inductor) or isinstance(branch, JosephsonElement):
+                    self.active_nodes.append(node_id)
+                else:
+                    self.passive_nodes.append(node_id)
+
+
+    def _build_matrices(self):
+        """Assemble the reduced capacitance and inverse-inductance matrices.
+
+        Implements the standard nodal construction:
+
+        * Off-diagonal ``[i, j]`` (with ``i != j``) is the *negative* sum
+          of element values for every branch connecting node ``i`` to node
+          ``j``.
+        * Diagonal ``[i, i]`` is set so that each row sums to zero before
+          ground elimination (Kirchhoff's law at the node).
+
+        The ground row and column are deleted at the end.
+        """
+        self.capacitance_matrix    = np.zeros((self.P, self.P))
+        self.inv_inductance_matrix = np.zeros((self.P, self.P))
+
+        # Off-diagonal entries: accumulate -C and -1/L for every branch
+        # whose endpoints are {i, j}.
+        for i in range(self.P):
+            for j in range(self.P):
+                if i == j:
+                    continue
+                for branch in self.branches:
+                    if set([i, j]) == set([self.s[branch._id], self.t[branch._id]]):
+                        if isinstance(branch, Capacitor):
+                            self.capacitance_matrix[i][j] -= branch.capacitance
+                        elif isinstance(branch, Inductor):
+                            self.inv_inductance_matrix -= (1/branch.inductance)
+
+        # Diagonal entries: enforce row-sum = 0 (i.e. each node's self-term
+        # equals the sum of magnitudes of its connections).
+        for i in range(self.P):
+            self.capacitance_matrix[i][i]    = -1 * np.sum(self.capacitance_matrix[i])
+            self.inv_inductance_matrix[i][i] = -1 * np.sum(self.inv_inductance_matrix[i])
+
+        # Drop the ground (row/column 0) to obtain the reduced matrices.
+        self.capacitance_matrix = np.delete(self.capacitance_matrix, 0, axis=0)
+        self.capacitance_matrix = np.delete(self.capacitance_matrix, 0, axis=1)
+
+        self.inv_inductance_matrix = np.delete(self.inv_inductance_matrix, 0, axis=0)
+        self.inv_inductance_matrix = np.delete(self.inv_inductance_matrix, 0, axis=1)
+
+    def build(self):
+        """Run node partitioning and matrix construction.
+
+        Must be called before :attr:`capacitance_matrix` or
+        :attr:`inv_inductance_matrix` are read.
+        """
+        self._partition_nodes()
+        self.P                      = len(self.active_nodes) + len(self.passive_nodes) + 1
+        self._build_matrices()
+        self.inv_capacitance_matrix = np.linalg.inv(self.capacitance_matrix)
+        self.charging_energy_matrix = ((e**2) / 2) * self.inv_capacitance_matrix
+        
+    def hamiltonian(self):
+        pass
+
+    def __str__(self):
+        """Human-readable list of the branches in the circuit.
+
+        Each branch is shown with its id, element type, and oriented
+        endpoints ``source --> target``.
+        """
+        rep = ""
+        for branch in self.branches:
+            rep += "-" * 20 + "\n"
+            if isinstance(branch, Capacitor):
+                type = "Capacitor"
+            elif isinstance(branch, Inductor):
+                type = "Linear Inductor"
+            elif isinstance(branch, JosephsonElement):
+                type = "Josephson Element"
+            rep += f"Branch: {branch._id}, {type}" + "\n"
+            rep += f"{self.s[branch._id]} --> {self.t[branch._id]}" + "\n"
+            rep += "-" * 20 + "\n"
+        return rep
+
+
+
+================ ./config.py ================
+"""
+Default drive parameters for the Gaussian SFQ pulse train.
+
+These constants control the train of Gaussian pulses produced by
+:func:`utils.create_gaussian_sfq_pulses` and consumed by
+:class:`CrankNicolson.CrankNicolsonSolver` when called from :mod:`main`.
+
+The amplitude is normalised so that the time-integral of a single Gaussian
+voltage pulse equals exactly the reduced flux quantum, mimicking an ideal
+Single-Flux-Quantum (SFQ) kick.
+"""
+
+import numpy as np
+from constants import REDUCED_FLUX_QUANTUM
+
+
+# Number of SFQ kicks in the pulse train.
+NUM_KICKS = 150
+
+# Standard deviation of each Gaussian pulse, in seconds.
+SIGMA = 1.7e-11
+
+# Amplitude scaling chosen so that  \int V(t) dt  per pulse equals the
+# reduced flux quantum  Phi_0^* = hbar/(2e).  For a unit Gaussian of width
+# SIGMA this requires V_peak = Phi_0^* / (SIGMA * sqrt(2 pi)).
+AMPLITUDE_SCALE = REDUCED_FLUX_QUANTUM / (SIGMA * np.sqrt(2 * np.pi))
+
+# Detuning between the pulse repetition period and the qubit period 1/f_01.
+# Set to zero for the resonant case.
+DETUNING = 0
+
+# Time-grid resolution: number of integration steps per qubit period.
+STEPS_PER_PERIOD = 200
+
+
+
+================ ./constants.py ================
+"""
+Physical constants used throughout the simulation.
+
+Re-exports SI constants from :mod:`scipy.constants` and adds the (reduced)
+flux quantum, which appears wherever a Josephson element couples to flux.
+"""
+
+from scipy.constants import e, h, hbar
+
+# Flux quantum  Phi_0 = h / (2e)  [Wb]; the period of a Josephson cosine
+# in flux units.
+FLUX_QUANTUM = h / (2 * e)
+
+# Reduced flux quantum  Phi_0^* = hbar / (2e) = Phi_0 / (2 pi)  [Wb].
+# Used in the SQUID effective-energy formula and as a natural unit for the
+# "external_flux" parameter throughout the codebase.
+REDUCED_FLUX_QUANTUM = hbar / (2 * e)
+
+
+
+================ ./CrankNicolson.py ================
+r"""
+Crank–Nicolson time evolution of a driven transmon.
+
+Solves the time-dependent Schrödinger equation
+
+.. math::
+
+    i \hbar \, \partial_t |\psi(t)\rangle =
+        \big[ H_0 + H_D(t) \big] |\psi(t)\rangle
+
+with the second-order, unconditionally stable Crank–Nicolson scheme.  At each
+time step the propagator is approximated by the Cayley form
+
+.. math::
+
+    \Big(\mathbb{1} + \tfrac{i \Delta t}{2 \hbar} H\Big) |\psi_{n+1}\rangle
+    = \Big(\mathbb{1} - \tfrac{i \Delta t}{2 \hbar} H\Big) |\psi_n\rangle
+
+evaluated with the Hamiltonian at the *midpoint* of the step (mid-point rule
+for the time-dependent drive).
+
+The drive Hamiltonian is
+
+.. math::
+
+    H_D(t) = 2 e \, \frac{C_g}{C_\Sigma} \, V(t) \, \hat n,
+
+i.e. the external voltage couples to the Cooper-pair number operator with an
+efficiency set by the coupling-to-total-capacitance ratio.
+"""
+
+import numpy as np
+
+from System import System
+from Wavefunction import Wavefunction
+from constants import e, hbar
+
+
+class CrankNicolsonSolver():
+    """Crank–Nicolson integrator for a driven transmon Hamiltonian."""
+
+    def __init__(self):
+        pass
+
+    def solve(self, system: System, initial_state: Wavefunction, external_voltage: np.ndarray, time: float, k: int):
+        r"""Evolve ``initial_state`` under ``H_0 + H_D(t)``.
+
+        Parameters
+        ----------
+        system : System
+            Quantised transmon, providing ``H_0`` and ``\hat n`` in the
+            energy basis as well as the circuit's coupling and total
+            capacitances.
+        initial_state : Wavefunction
+            State at ``time[0]`` expressed in the energy basis (the
+            ``"energy"`` key must be populated).  This object is mutated in
+            place during the loop.
+        external_voltage : np.ndarray
+            Drive voltage ``V(t)`` sampled on the same grid as ``time``,
+            in Volts.
+        time : np.ndarray
+            Uniformly-spaced time grid in seconds.  The step size is taken
+            to be ``time[1] - time[0]``.
+        k : int
+            The index of the subsystem we want to evolve with Crank Nicolson.
+
+        Returns
+        -------
+        state : Wavefunction
+            Final wavefunction after the last completed step.
+        P0, P1, P2 : np.ndarray
+            Population (``|c_k|^2``) of the lowest three energy levels at
+            each time step.  Shape ``(len(external_voltage),)``.
+
+        Notes
+        -----
+        The loop runs ``num_steps - 1`` iterations and writes populations
+        for indices ``[0, num_steps - 2]``; the final entry of each array
+        remains zero by construction.
+        """
+
+        n = len(initial_state["energy"])
+        num_steps = len(external_voltage)
+        dt = time[1] - time[0]
+
+        state = initial_state
+
+        # Population of the |0>, |1>, |2> energy eigenstates at each step.
+        P0 = np.zeros(num_steps)
+        P1 = np.zeros(num_steps)
+        P2 = np.zeros(num_steps)
+
+        for i in range(num_steps - 1):
+
+            # Mid-point voltage gives a second-order accurate evaluation
+            # of the time-dependent drive Hamiltonian on the interval.
+            voltage_midpoint = (external_voltage[i] + external_voltage[i+1]) / 2
+
+            # Drive Hamiltonian:
+            #   H_D = 2e * (C_g / C_\Sigma) * V(t) * \hat n
+            HD_midpoint = np.zeros((system.n_full, system.n_full))
+            n_e_k = system.subsystems[k].circuit.coupling_capacitance * external_voltage / (2 * e)
+            
+            for l in range(len(system.subsystems)):
+                HD += -8 * n_e_k * system.circuit.charging_energy_matrix[k][l] * system.upgraded_subsystems[l].n["energy"]
+
+            H = system.H0["energy"] + HD_midpoint
+
+            # Cayley form of the propagator:
+            #   A psi_{n+1} = B psi_n,   A = I + i dt/(2 hbar) H,
+            #                            B = I - i dt/(2 hbar) H.
+            A = np.eye(n) + (1j * (dt / (2*hbar)) * H)
+            B = np.eye(n) - (1j * (dt / (2*hbar)) * H)
+
+            state["energy"] = np.linalg.solve(A, B @ state["energy"])
+
+            # Record level populations at the new time.
+            P0[i] = np.abs(state["energy"][0])**2
+            P1[i] = np.abs(state["energy"][1])**2
+            P2[i] = np.abs(state["energy"][2])**2
+
+        return state, P0, P1, P2
+
+
+
+================ ./DCSQUID.py ================
+"""
+DC SQUID circuit model.
+
+A *DC SQUID* (Direct-Current Superconducting QUantum Interference Device) is a
+loop containing two Josephson junctions in parallel, threaded by an external
+flux.  In a transmon, it acts as a flux-tunable Josephson element: the two
+junctions interfere to produce an *effective* Josephson energy that depends
+on the applied flux.
+
+The :class:`DCSQUID` class assembles the four constituent branches (two
+Josephson elements and their two parallel geometric capacitances), wires them
+between ground and a single *island* node, and forwards the topology to the
+:class:`~Circuit.Circuit` base class.
+
+The static method :meth:`DCSQUID.calculate_effective_josephson_energy`
+returns the flux-dependent effective Josephson energy used by the
+:mod:`Quantize` step.
+"""
+
+import numpy as np
+
+from Circuit import Circuit
+from Node import Node
+from Branch import Capacitor, Inductor, JosephsonElement
+from Graph import Multidigraph
+from constants import REDUCED_FLUX_QUANTUM
+
+
+class DCSQUID(Circuit):
+    """Two Josephson junctions in parallel, possibly asymmetric.
+
+    Parameters
+    ----------
+    ground_node : Node
+        Pre-existing ground node (must have ``_id == 0``); the SQUID island
+        is created internally and connected to ``ground_node`` by every
+        branch.
+    left_jj_capacitance, right_jj_capacitance : float
+        Geometric (shunt) capacitance of each junction, in Farads.  Pass
+        ``0`` if the junction's own capacitance is being absorbed into a
+        separate shunt elsewhere in the circuit.
+    left_josephson_energy, right_josephson_energy : float
+        Josephson energy of each junction, in Joules.  The asymmetry
+        ``d = (E_R - E_L) / (E_R + E_L)`` enters the effective-energy
+        formula below.
+
+    Notes
+    -----
+    The SQUID island is created during construction and exposed as
+    ``self.island``; this is the node carrying the flux-degree of freedom
+    of the transmon when the SQUID is wrapped by :class:`~Transmon.Transmon`.
+    """
+
+    def __init__(self,
+                 ground_node: Node,
+                 left_jj_capacitance: float,
+                 left_josephson_energy: float,
+                 right_jj_capacitance: float,
+                 right_josephson_energy: float):
+
+        self.left_jj_capacitance    = left_jj_capacitance
+        self.left_josephson_energy  = left_josephson_energy
+        self.right_jj_capacitance   = right_jj_capacitance
+        self.right_josephson_energy = right_josephson_energy
+
+        self.gnd = ground_node
+
+        # The single floating "island" node of the SQUID; every branch
+        # below connects ground -> island.
+        self.island = Node()
+
+        self.nodes = [self.gnd, self.island]
+
+        # Left junction: a Josephson element in parallel with its geometric
+        # capacitance.
+        left_jj_capacitor      = Capacitor(self.left_jj_capacitance)
+        left_josephson_element = JosephsonElement(self.left_josephson_energy)
+
+        # Right junction: same structure as the left.
+        right_jj_capacitor      = Capacitor(self.right_jj_capacitance)
+        right_josephson_element = JosephsonElement(self.right_josephson_energy)
+
+        self.branches = [left_jj_capacitor, left_josephson_element,
+                         right_jj_capacitor, right_josephson_element]
+
+        # All branches share the same orientation: ground -> island.
+        self.s = [self.gnd._id] * len(self.branches)
+        self.t = [self.island._id] * len(self.branches)
+
+        graph = Multidigraph(
+            nodes=self.nodes,
+            branches=self.branches,
+            s=self.s,
+            t=self.t
+        )
+
+        super().__init__(graph)
+
+    @staticmethod
+    def calculate_effective_josephson_energy(left_josephson_energy: float, right_josephson_energy: float, external_flux: float):
+        r"""Effective Josephson energy of the (possibly asymmetric) SQUID.
+
+        For a SQUID with junction energies ``E_{J,L}`` and ``E_{J,R}`` and
+        external flux ``\Phi_{ext}`` threading the loop, the effective
+        Josephson energy seen by the transmon island is
+
+        .. math::
+
+            E_J^{\text{eff}}(\Phi_{ext}) = E_{J\Sigma}\,
+                \cos\!\Big(\tfrac{\Phi_{ext}}{2\,\Phi_0^{*}}\Big)
+                \sqrt{1 + d^2 \tan^2\!\Big(\tfrac{\Phi_{ext}}{2\,\Phi_0^{*}}\Big)}
+
+        where ``E_{J\Sigma} = E_{J,L} + E_{J,R}`` is the sum,
+        ``d = (E_{J,R} - E_{J,L}) / E_{J\Sigma}`` is the asymmetry, and
+        ``\Phi_0^{*} = \hbar / (2e)`` is the *reduced* flux quantum.
+
+        Parameters
+        ----------
+        left_josephson_energy, right_josephson_energy : float
+            Josephson energies of the two junctions, in Joules.
+        external_flux : float
+            External flux threading the SQUID loop, in Webers.  Use
+            multiples of :data:`constants.REDUCED_FLUX_QUANTUM` for
+            convenience.
+
+        Returns
+        -------
+        float
+            Effective Josephson energy in Joules.
+        """
+        total_josephson_energy = left_josephson_energy + right_josephson_energy
+        d = (right_josephson_energy - left_josephson_energy) / total_josephson_energy
+        return total_josephson_energy \
+                * np.cos(external_flux / (2 * REDUCED_FLUX_QUANTUM)) \
+                    * np.sqrt(1 + (d**2) * np.tan(external_flux / (2 * REDUCED_FLUX_QUANTUM))**2)
+
+
+
+================ ./Expression.py ================
+from __future__ import annotations
+
+import numpy as np
+
+from Operator import Operator
+
+class Expression():
+    
+    def __add__(self, other):
+        return Add(self, other)
+    
+    def __mul__(self, other):
+        return Mul(self, other)
+    
+    def __pow__(self, other):
+        return Pow(self, other)
+    
+    @staticmethod
+    def realize(expression: Expression, n_charge: int):        
+        if isinstance(expression, Scalar):
+            return expression.value
+        elif isinstance(expression, Op) and expression.name == "n":
+            # Symmetric integer charge ladder n in {-N, ..., +N}.
+            N = int((n_charge - 1) / 2)
+            
+            charge_values = np.array([k for k in range(-N, N + 1)])
+            return np.diag(charge_values)
+        
+        elif isinstance(expression, Cos) and isinstance(expression.a, Op) and (expression.a.name == "phi"):
+            # Symmetric integer charge ladder n in {-N, ..., +N}.
+            N = int((n_charge - 1) / 2)
+            
+            upper_lower_matrix = np.zeros((n_charge, n_charge))
+            for i in range(-N, N):
+                r = i + N
+                upper_lower_matrix += np.outer(np.eye(n_charge)[r], np.eye(n_charge)[r+1]) + np.outer(np.eye(n_charge)[r+1], np.eye(n_charge)[r])
+            return upper_lower_matrix / 2
+        
+        elif isinstance(expression, Add):
+            a = Expression.realize(expression.a, n_charge)
+            b = Expression.realize(expression.b, n_charge)
+            return a + b
+        
+        elif isinstance(expression, Mul):
+            a = Expression.realize(expression.a, n_charge)
+            b = Expression.realize(expression.b, n_charge)
+            print("a")
+            print(a)
+            print(b)
+            return a * b
+            
+        elif isinstance(expression, Pow):
+            a = Expression.realize(expression.a, n_charge)
+            b = Expression.realize(expression.b, n_charge)
+            if isinstance(a, Operator):
+                result = np.eye(n_charge)
+                for i in range(b):
+                    result @=  a
+                return result
+            else:
+                return a**b
+            
+        raise TypeError(f"Don't know how to realize: {expression}")
+
+        
+# Interal node
+class Add(Expression):
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+        
+    def __str__(self):
+        return f"{self.a} + {self.b}"
+
+# Interal node
+class Mul(Expression):
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+        
+    def __str__(self):
+        return f"{self.a} * {self.b}"
+
+# Interal node
+class Pow(Expression):
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+        
+    def __str__(self):
+        return f"{self.a}**{self.b}"
+    
+# Interal node
+class Cos(Expression):
+    def __init__(self, a):
+        self.a = a
+
+    def __str__(self):
+        return f"cos({self.a})"
+    
+# Leaf node
+class Scalar(Expression):
+    def __init__(self, value: float):
+        self.value = value
+        
+    def __str__(self):
+        return f"{self.value}"
+        
+# Leaf node
+class Op(Expression):
+    def __init__(self, name: str):
+        self.name = name
+        
+    def __str__(self):
+        return self.name
+
+
+================ ./Graph.py ================
+"""
+Graph container used to describe a circuit topology.
+
+A circuit is encoded as a directed multigraph: each branch has an explicit
+*source* node and *target* node, and multiple branches are allowed between the
+same pair of nodes (e.g. a Josephson junction is represented as a
+:class:`~Branch.Capacitor` *and* a :class:`~Branch.JosephsonElement` sharing
+the same endpoints).
+
+The :class:`Multidigraph` class is intentionally a thin, immutable bundle of
+the four arrays needed by :class:`~Circuit.Circuit` to assemble the
+capacitance and inverse-inductance matrices.
+"""
+
+from Node import Node
+from Branch import Branch
+
+
+class Multidigraph():
+    """Container describing the topology of a lumped-element circuit.
+
+    Parameters
+    ----------
+    nodes : list[Node]
+        All nodes in the circuit, including ground.  By convention the
+        ground node is the one with ``_id == 0``.
+    branches : list[Branch]
+        All two-terminal elements (capacitors, inductors, Josephson
+        elements) that connect the nodes.
+    s : list[int]
+        Source-node id for each branch.  ``s[i]`` is the id of the node at
+        the source end of ``branches[i]``.
+    t : list[int]
+        Target-node id for each branch (same indexing convention as ``s``).
+
+    Notes
+    -----
+    The (s, t) lists encode an *oriented* multigraph, but the matrix
+    construction in :class:`~Circuit.Circuit` is symmetric under
+    source/target swap because capacitance and inverse-inductance are
+    symmetric two-terminal quantities.
+    """
+
+    def __init__(self, nodes: list[Node], branches: list[Branch], s: list[int], t: list[int]):
+        self.nodes = nodes
+        self.branches = branches
+        self.s = s
+        self.t = t
+
+
+
+================ ./multi_qubit.py ================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from constants import e, h, REDUCED_FLUX_QUANTUM
+from config import NUM_KICKS, AMPLITUDE_SCALE, DETUNING, STEPS_PER_PERIOD, SIGMA
+from Node import Node
+from System import System
+from DCSQUID import DCSQUID
+from Transmon import Transmon
+from Quantize import quantize
+from CrankNicolson import CrankNicolsonSolver
+from Wavefunction import Wavefunction
+from Branch import Capacitor
+from utils import create_gaussian_sfq_pulses
+from Circuit import Circuit
+from Graph import Multidigraph
+
+
+def main():
+    """Run the end-to-end transmon-driving simulation."""
+    # ------------------------ Hyperparameters ------------------------
+    # Charge basis size; states run from -(n-1)/2 to +(n-1)/2.  Must be
+    # odd so the basis is symmetric around zero.
+    n_charge = 101
+    n_trunc  = 5
+
+    # ---- Multi-Qubit Circuit Paramters ----
+    external_flux_on     = np.array([0.130, 0.352, 0.130]) * REDUCED_FLUX_QUANTUM
+    external_flux_off    = np.array([0.130, 0.376, 0.130]) * REDUCED_FLUX_QUANTUM
+
+    # ---- Circuit Capacitances ----
+    shunt_capacitance_1 = 70e-15   # [F]
+    shunt_capacitance_2 = 70e-15   # [F]
+    shunt_capacitance_c = 60e-15   # [F]
+    coup_capacitance_12 = 0.25e-15 # [F]
+    coup_capacitance_1c = 2e-15    # [F]
+    coup_capacitance_2c = 2e-15    # [F]
+    coup_capacitance_1e = 7.5e-15  # [F]
+    coup_capacitance_2e = 7.5e-15  # [F]
+    
+    # ---- Circuit Josephson Energies ----
+    left_jj_capacitance_1  = 0
+    right_jj_capacitance_1 = 0
+    left_jj_energy_1       = 7e-9  * REDUCED_FLUX_QUANTUM  # [J]
+    right_jj_energy_1      = 21e-9 * REDUCED_FLUX_QUANTUM  # [J]
+    
+    left_jj_capacitance_c  = 0
+    right_jj_capacitance_c = 0
+    left_jj_energy_c       = 18e-9  * REDUCED_FLUX_QUANTUM  # [J]
+    right_jj_energy_c      = 36e-9 * REDUCED_FLUX_QUANTUM  # [J]
+    
+    left_jj_capacitance_2  = 0
+    right_jj_capacitance_2 = 0
+    left_jj_energy_2       = 7e-9  * REDUCED_FLUX_QUANTUM  # [J]
+    right_jj_energy_2      = 21e-9 * REDUCED_FLUX_QUANTUM  # [J]
+
+    # ---- Build Ground Node ----
+    gnd = Node()
+
+    # ---- Build DCSQUID Circuit Objects ----
+    dcsquid_1 = DCSQUID(
+        ground_node=gnd,
+        left_jj_capacitance=left_jj_capacitance_1,
+        left_josephson_energy=left_jj_energy_1,
+        right_jj_capacitance=right_jj_capacitance_1,
+        right_josephson_energy=right_jj_energy_1
+    )
+    
+    dcsquid_c = DCSQUID(
+        ground_node=gnd,
+        left_jj_capacitance=left_jj_capacitance_c,
+        left_josephson_energy=left_jj_energy_c,
+        right_jj_capacitance=right_jj_capacitance_c,
+        right_josephson_energy=right_jj_energy_c
+    )
+    
+    dcsquid_2 = DCSQUID(
+        ground_node=gnd,
+        left_jj_capacitance=left_jj_capacitance_2,
+        left_josephson_energy=left_jj_energy_2,
+        right_jj_capacitance=right_jj_capacitance_2,
+        right_josephson_energy=right_jj_energy_2
+    )
+    
+    # ---- Build Transmon Circuit Objects ----
+    transmon_1 = Transmon(
+        dcsquid=dcsquid_1,
+        shunt_capacitance=shunt_capacitance_1,
+        coupling_capacitance=coup_capacitance_1e
+    )
+    
+    transmon_c = Transmon(
+        dcsquid=dcsquid_c,
+        shunt_capacitance=shunt_capacitance_c,
+        coupling_capacitance=0
+    )
+    
+    transmon_2 = Transmon(
+        dcsquid=dcsquid_2,
+        shunt_capacitance=shunt_capacitance_2,
+        coupling_capacitance=coup_capacitance_2e
+    )
+    
+    transmons = [transmon_1, transmon_c, transmon_2]
+    
+    # ---- Create Branches For Inter-Island Capacitances ----
+    cap_12 = Capacitor(capacitance=coup_capacitance_12)
+    
+    cap_1c = Capacitor(capacitance=coup_capacitance_1c)
+    
+    cap_2c = Capacitor(capacitance=coup_capacitance_2c)
+    
+    # ---- Create Graph Representation ----
+    graph = Multidigraph(
+        nodes=[gnd, transmon_1.island, transmon_c.island, transmon_2.island],
+        branches=transmon_1.branches + transmon_c.branches + transmon_2.branches + [cap_12, cap_1c, cap_2c],
+        s=transmon_1.s + transmon_c.s + transmon_2.s + [transmon_1.island._id, transmon_1.island._id, transmon_2.island._id],
+        t=transmon_1.t + transmon_c.t + transmon_2.t + [transmon_2.island._id, transmon_c.island._id, transmon_c.island._id],
+    )
+    
+    # ---- Create Multi-Qubit Transmon Circuit ----
+    circuit = Circuit(
+        graph=graph
+    )
+
+    # ---- Partition Circuit Nodes and Build Capacitance/Inverse Inductance Matrices ----
+    circuit.build()
+    
+    # ---- Quantize the Circuit Object ----
+    subsystems = [quantize(circuit=t, 
+                           charging_energy=circuit.charging_energy_matrix[k][k],
+                           external_flux=external_flux_off[k], n_charge=n_charge)
+                  for (k, t) in enumerate(transmons)]
+    
+    # ---- Create the System from the SubSystems----
+    system = System(
+        circuit=circuit,
+        subsystems=subsystems,
+        n_charge=n_charge,
+        n_trunc=n_trunc
+    )
+    
+    print("Capacitance Matrix [fF]:")
+    print(circuit.capacitance_matrix * 1e15)
+    
+    # ---- Retrieve Charging Energies of Each Transmon Circuit ----
+    charging_energies = np.array([circuit.charging_energy_matrix[k][k] for k in range(len(subsystems))])
+    
+    # ---- Retrieve Idling Transmon Josephson Energies (From DCSQUID) ----
+    josephson_energies = np.array([DCSQUID.calculate_effective_josephson_energy(
+        left_josephson_energy=t.dcsquid.left_josephson_energy,
+        right_josephson_energy=t.dcsquid.right_josephson_energy,
+        external_flux=external_flux_off[k]
+    ) for (k, t) in enumerate(transmons)])
+
+    print(f"EC = {charging_energies}  EJ = {josephson_energies}  EJ/EC = {josephson_energies/charging_energies}")
+    
+    print("Idling Hamiltonian: ")
+    print(system.H0["energy"])
+    
+    # ---- Qubit Frequencies ----
+    print("Qubit Frequencies")
+    print(system.frequencies)
+    
+    # ---- Qubit Angular Frequencies ----
+    print("Qubit Angular Frequencies")
+    print(system.angular_frequencies)
+
+    # ---- Qubit Subsystem Index to Drive ----
+    k = 0
+    
+    # ---- Initialize State ----
+    # Start in the ground state of the energy basis: amplitude 1 on |0>.
+    prob_amps = np.zeros(n_trunc**len(subsystems))
+    prob_amps[0] = 1
+    initial_state = Wavefunction(basis_to_coefs={"energy": prob_amps})
+    solver        = CrankNicolsonSolver()
+
+    # To use the SFQ lookup table instead of Gaussians, uncomment:
+    # lookup = pd.read_csv("sfq_V_lookup.csv")
+    # time, external_voltage = lookup["time_s"].to_numpy(), lookup["voltage_V"].to_numpy()
+
+    time, external_voltage = create_gaussian_sfq_pulses(
+        num_kicks=NUM_KICKS,
+        amplitude_scale=AMPLITUDE_SCALE,
+        driving_period=(1 / system.frequencies[k]) + DETUNING,
+        pulse_width=SIGMA,
+        steps_per_period=STEPS_PER_PERIOD
+    )
+
+    # ---- Evolve ----
+    final_state, P0, P1, P2 = solver.solve(
+        system=system,
+        initial_state=initial_state,
+        external_voltage=external_voltage,
+        time=time,
+        k=k
+    )
+
+    # ---- Plot ground / first / second level populations vs time ----
+    plt.plot(time, P0, label='P0')
+    plt.plot(time, P1, label='P1')
+    plt.plot(time, P2, label='P2')
+    plt.legend()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================ ./Node.py ================
+"""
+Node primitives for the circuit graph.
+
+A :class:`Node` represents a single electrical node (a point of common voltage)
+in a lumped-element circuit. Nodes are addressed by an auto-incrementing
+integer id (``_id``) so that branches, source/target maps, and matrix indices
+can refer to them unambiguously.
+
+Convention
+----------
+The first :class:`Node` created in a session is treated as the *ground* node
+(``_id == 0``) by the rest of the pipeline (e.g. :class:`Circuit`).  Build
+your circuits by instantiating ground first, before any other nodes.
+"""
+
+
+class Node():
+    """A single electrical node in the circuit graph.
+
+    Attributes
+    ----------
+    _id : int
+        Unique, monotonically increasing identifier assigned at construction
+        time.  ``_id == 0`` is reserved for ground (the first node created).
+    """
+
+    # Class-level counter that hands out the next unique node id.
+    global_id = 0
+
+    def __init__(self):
+        self._id = Node.global_id
+        Node.global_id += 1
+
+
+
+================ ./Operator.py ================
+"""
+Multi-basis quantum operator container.
+
+Quantum operators in this codebase are represented as dense matrices.  An
+operator is often most naturally written in one basis (e.g. the charge basis
+for a transmon Hamiltonian) but used in another (e.g. the energy
+eigenbasis after diagonalisation).  :class:`Operator` stores the matrix
+representation in *each* basis it has been computed for, keyed by a string
+label such as ``"charge"`` or ``"energy"``.
+
+This avoids re-computing basis transformations on the fly and lets callers
+mix operators across bases with explicit, readable indexing
+(``op["energy"]``).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+
+class Operator():
+    """A quantum operator stored as one or more matrix representations.
+
+    Parameters
+    ----------
+    basis_to_matrix : dict[str, np.ndarray]
+        Mapping from a basis label (e.g. ``"charge"``, ``"energy"``) to the
+        matrix representation of the operator in that basis.  Both
+        representations must describe the *same* underlying operator (i.e.
+        related by a unitary basis transformation).
+
+    Examples
+    --------
+    >>> n = Operator({"charge": np.diag([-1, 0, 1])})
+    >>> n["charge"].shape
+    (3, 3)
+    >>> n["energy"] = U.conj().T @ n["charge"] @ U  # add a new basis
+    """
+
+    def __init__(self, basis_to_matrix: dict[str, np.ndarray]) -> None:
+        self._basis_to_matrix = basis_to_matrix
+
+    def __getitem__(self, basis: str) -> np.ndarray:
+        """Return the matrix representation in the given basis."""
+        return self._basis_to_matrix[basis]
+
+    def __setitem__(self, basis: str, matrix: np.ndarray) -> None:
+        """Store a new basis representation of the operator."""
+        self._basis_to_matrix[basis] = matrix
+        
+    def __add__(self, other: Operator):
+        new_op = Operator({})
+        
+        for basis, matrix in self._basis_to_matrix.items():
+            new_op[basis] = self[basis] + other[basis]
+        
+        return new_op
+    
+    def __mul__(self, other: Operator | float):
+        new_op = Operator({})
+        
+        if isinstance(other, Operator):
+            for basis, matrix in self._basis_to_matrix.items():
+                new_op[basis] = self[basis] @ other[basis]
+        else:
+            for basis, matrix in self._basis_to_matrix.items():
+                new_op[basis] = self[basis] * other
+        
+        return new_op
+        
+    def truncate(self, dim: int) -> Operator:
+        truncated_op = Operator({})
+        
+        for basis, matrix in self._basis_to_matrix.items():
+            truncated_op[basis] = matrix[:dim, :dim]
+            
+        return truncated_op
+    
+    def upgrade(self, k: int, num_subsystems: int, dim: int):
+        upgraded_op = Operator({})
+        
+        for basis, matrix in self._basis_to_matrix.items():
+            factors = [np.eye(dim) for _ in range(num_subsystems)]
+            factors[k] = matrix
+            
+            result = factors[0]
+            for f in factors[1:]:
+                result = np.kron(result, f)
+                
+            upgraded_op[basis] = result
+                        
+        return upgraded_op
+            
+        
+            
+
+
+
+================ ./playground.py ================
+from Expression import *
+
+def main():
+    expression = Scalar(4)**2 * Op("n")
+
+    print(expression)
+
+
+if __name__=="__main__":
+    main()
+
+
+================ ./Quantize.py ================
+"""
+Canonical quantisation of the transmon circuit.
+
+Given a built :class:`~Transmon.Transmon` (with its capacitance matrix) and
+an external flux through the SQUID loop, :func:`quantize_transmon`:
+
+1. Computes the charging energy ``E_C = e^2 / (2 C_\Sigma)``.
+2. Computes the flux-tunable effective Josephson energy ``E_J(\Phi_{ext})``.
+3. Builds the charge-basis Hamiltonian
+
+   .. math::
+
+       H_0 = 4 E_C \hat n^2 - \frac{E_J}{2} \sum_{n} (|n\rangle\langle n+1| + h.c.)
+
+4. Diagonalises ``H_0`` and constructs the **energy-basis** representation
+   of ``H_0`` (diagonal of eigenvalues) and of the charge operator ``\hat n``.
+
+The result is bundled into a :class:`~System.System` for downstream use by
+:class:`~CrankNicolson.CrankNicolsonSolver`.
+"""
+
+import numpy as np
+
+from System import System, SubSystem
+from Circuit import Circuit
+from Operator import Operator
+from constants import e
+from Expression import *
+
+
+def quantize(circuit: Circuit, charging_energy: float, external_flux: float, n_charge: int):
+    r"""Quantise a transmon and return a ready-to-evolve :class:`System`.
+
+    Parameters
+    ----------
+    transmon : Transmon
+        Transmon circuit; :meth:`Circuit.build` must already have been
+        called so that ``transmon.capacitance_matrix`` is populated.
+    external_flux : float
+        External flux through the SQUID loop, in Webers.
+    n_charge : int
+        Number of charge basis states; must be **odd** so that the basis
+        ranges symmetrically from ``-N`` to ``+N`` with ``N = (n_charge-1)/2``.
+        Larger values give better convergence but quadratic memory cost.
+
+    Returns
+    -------
+    System
+        Bundled circuit, charge operator, and Hamiltonian, each available
+        in both the ``"charge"`` and ``"energy"`` bases.
+    """
+
+    # Symmetric integer charge ladder n in {-N, ..., +N}.
+    N = int((n_charge - 1) / 2)
+    charge_values = np.array([k for k in range(-N, N + 1)])
+
+    # Cooper-pair number operator (diagonal in the charge basis).
+    n = Operator(
+        basis_to_matrix={"charge": np.diag(charge_values)}
+    )
+
+    # Bare Hamiltonian in the charge basis.
+    H0 = Operator(
+        basis_to_matrix={"charge":  Expression.realize(
+            expression=circuit.hamiltonian(charging_energy, external_flux),
+            n_charge=n_charge
+            )
+        }
+    )
+
+    # Diagonalise H0; columns of `energy_states` are the energy eigenvectors
+    # expressed in the charge basis.  `eigh` is used because H0 is Hermitian.
+    energies, energy_states = np.linalg.eigh(H0["charge"])
+
+    # Energy-basis representation: H0 is diagonal of eigenvalues, and the
+    # charge operator is rotated by the eigenvector matrix.
+    H0["energy"] = np.diag(energies)
+    n["energy"] = energy_states.conj().T @ n["charge"] @ energy_states
+
+    subsystem = SubSystem(
+        circuit=circuit,
+        charge_operator=n,
+        unperturbed_hamiltonian=H0
+    )
+
+    return subsystem
+
+
+
+================ ./riyas_pulses.py ================
+"""
+RCSJ-based generation of a realistic SFQ voltage waveform.
+
+This standalone script integrates the Resistively and Capacitively Shunted
+Junction (RCSJ) equation for a Josephson junction biased near its critical
+current and pulsed by a train of rectangular current excursions.  Each
+excursion drives the phase across one ``2 \pi`` slip, producing a
+single-flux-quantum (SFQ) voltage pulse of area exactly ``\Phi_0``.
+
+The simulated voltage waveform is downsampled onto a uniform time grid and
+written to ``sfq_V_lookup.csv`` so that :mod:`main` can load it as the drive
+waveform instead of the analytic Gaussian train from
+:func:`utils.create_gaussian_sfq_pulses`.
+
+Run as::
+
+    python riyas_pulses.py
+
+The script prints diagnostics about each pulse (the area should be very
+close to ``\Phi_0`` and the ratio close to ``1.0``) and writes the lookup
+table next to itself.
+"""
+
+import os
+import numpy as np
+from scipy.integrate import solve_ivp
+
+# ---------------------------------------------------------------------
+# Physical constants and reduced-flux factor.
+# ---------------------------------------------------------------------
+q      = 1.6e-19          # Elementary charge [C]
+h_bar  = 1.05e-34         # Reduced Planck constant [J s]
+factor = h_bar / (2 * q)  # Reduced flux quantum Phi_0/(2 pi) [V s]
+
+# ---------------------------------------------------------------------
+# Junction parameters (RCSJ model).
+# ---------------------------------------------------------------------
+Ic  = 1e-03   # Critical current        [A]
+C   = 5.7e-14 # Junction capacitance    [F]
+Rn  = 4       # Normal-state resistance [Ohm]
+Rs  = 2       # Shunt resistance        [Ohm]
+res = 1/Rn + 1/Rs  # Combined parallel conductance [S]
+
+# ---------------------------------------------------------------------
+# Drive parameters.
+# ---------------------------------------------------------------------
+Ibias      = 0.85 * Ic   # DC bias current
+Ip         = 0.20 * Ic   # Rectangular pulse amplitude on top of Ibias
+Npulses    = 105         # Number of SFQ pulses to emit
+t_rec      = 1 / 5e9     # Recovery time between pulses (5 GHz repetition)
+rect_width = 5e-12       # Rectangular pulse width [s]
+
+Phi0         = 2 * np.pi * factor  # Flux quantum [V s]
+Ihigh        = Ibias + Ip
+# Estimated phase-slip duration; used to bound the integrator's max step
+# so that the slip is well-resolved.
+tau_slip_est = Phi0 / (res * np.sqrt(Ihigh**2 - Ic**2))
+max_step     = tau_slip_est / 50
+
+
+def rectangular_pulse(t, t0):
+    """Bias-plus-rectangular drive current at time ``t``.
+
+    Returns ``Ibias + Ip`` while ``t`` lies inside ``[t0, t0 + rect_width]``
+    and ``Ibias`` everywhere else.
+    """
+    return Ibias + Ip * float(t0 <= t <= t0 + rect_width)
+
+
+def rcsj(t, y, I_of_t):
+    r"""Right-hand side of the RCSJ equation in dimensionless form.
+
+    State vector ``y = [phi, phi_dot]`` where ``phi`` is the
+    superconducting phase across the junction.  The equation is
+
+    .. math::
+
+        \ddot \phi = \frac{I(t)}{C\,\Phi_0/(2\pi)}
+                   - \frac{I_c}{C\,\Phi_0/(2\pi)} \sin\phi
+                   - \frac{1/R}{C}\dot \phi
+    """
+    I = I_of_t(t)
+    return [y[1],
+            I / (C * factor) - (Ic / (C * factor)) * np.sin(y[0]) - (res / C) * y[1]]
+
+
+def phase_event_2pi(phi_ref):
+    """Build a SciPy event that triggers when the phase has slipped by 2π.
+
+    The event fires (and terminates integration of the current segment) the
+    first time ``phi(t) - phi_ref == 2 pi`` with positive direction —
+    i.e. exactly one SFQ slip.
+    """
+    def event(t, y):
+        return (y[0] - phi_ref) - 2 * np.pi
+    event.terminal  = True
+    event.direction = +1
+    return event
+
+
+# ---------------------------------------------------------------------
+# Initial conditions: phase parked at the static-bias fixed point.
+# ---------------------------------------------------------------------
+y0        = np.array([np.arcsin(Ibias / Ic), 0.0])
+t_pointer = 0.0
+
+t_segs = []   # Time segments produced by each pulse + recovery.
+y_segs = []   # Corresponding state segments.
+I_segs = []   # Drive current samples on each segment.
+t_events = [] # Times at which each 2π slip occurred.
+
+for k in range(Npulses):
+    t0      = t_pointer
+    I_pulse = lambda t, t0=t0: rectangular_pulse(t, t0)
+
+    # Integrate the RCSJ equation forwards until the phase slips by 2π,
+    # at which point the event fires and integration stops.
+    sol = solve_ivp(
+        lambda t, y: rcsj(t, y, I_pulse),
+        [t0, t0 + rect_width + 10e-12],
+        y0,
+        method="RK45",
+        events=phase_event_2pi(y0[0]),
+        rtol=1e-10, atol=1e-13,
+        max_step=max_step,
+    )
+
+    if not sol.t_events[0].size:
+        raise RuntimeError(f"Pulse {k+1}: No 2π slip detected.")
+
+    te = sol.t_events[0][0]
+    ye = sol.y_events[0][0]
+    t_events.append(te)
+
+    # Append the active part of the trajectory.
+    t1 = sol.t; y1 = sol.y.T
+    if t_segs:
+        # Drop the duplicate seam point shared with the previous segment.
+        t1 = t1[1:]; y1 = y1[1:]
+    t_segs.append(t1); y_segs.append(y1)
+    I_segs.append(np.array([I_pulse(t) for t in t1]))
+
+    # Recovery: fast jump back to the static fixed point.  We do this
+    # synthetically (two-point segment) rather than re-integrating to keep
+    # the script fast.
+    t2 = np.array([te, te + t_rec])
+    y2 = np.array([[ye[0], ye[1]], [np.arcsin(Ibias / Ic), 0.0]])
+
+    t_segs.append(t2[1:]); y_segs.append(y2[1:])
+    I_segs.append(np.array([Ibias]))
+
+    t_pointer = t2[-1]
+    y0 = np.array([np.arcsin(Ibias / Ic), 0.0])
+
+# Concatenate all segments into one timeline and convert phi_dot -> voltage
+# using the Josephson voltage relation V = (hbar / 2e) * d phi / d t.
+t_full = np.concatenate(t_segs)
+y_full = np.concatenate(y_segs)
+I_full = np.concatenate(I_segs)
+V      = factor * y_full[:, 1]
+
+# Sanity-check: integrated voltage per pulse should equal Phi_0.
+area = np.trapezoid(V, t_full)
+print(f"Area: {area:.4e} V·s  |  Phi0: {factor*2*np.pi:.4e} V·s  |  ratio: {area/(factor*2*np.pi):.6f}")
+print(f"Raw solver points: {len(t_full)}")
+print(f"2π events at: {[f'{te:.4e} s' for te in t_events]}")
+
+# Resample onto a 100k-point uniform grid for fast lookup at solve-time.
+t_grid = np.linspace(t_full[0], t_full[-1], 100_000)
+V_grid = np.interp(t_grid, t_full, V)
+I_grid = np.interp(t_grid, t_full, I_full)
+
+# Persist next to this script.
+out_path = os.path.join(os.path.dirname(__file__), "sfq_V_lookup.csv")
+header = "time_s,voltage_V,current_A"
+np.savetxt(out_path, np.column_stack([t_grid, V_grid, I_grid]),
+           delimiter=",", header=header, comments="", fmt="%.6e")
+
+print(f"Lookup table written: {out_path}  ({len(t_grid)} rows)")
+
+
+
+================ ./scripts/main1.py ================
+"""
+Skeleton/stub entry point for an alternative simulation script.
+
+This file is a work-in-progress placeholder: it imports
+``create_gaussian_sfq_pulses`` and calls it with no arguments, which is
+intentionally incomplete.  Use :mod:`main` for the working pipeline.
+"""
+
+import numpy as np
+
+from transmons.simulation.utils import create_gaussian_sfq_pulses
+
+
+def main():
+    """Placeholder entry point — does not yet pass real arguments."""
+    voltage = create_gaussian_sfq_pulses(
+
+    )
+
+
+if __name__=="__main__":
+    main()
+
+
+
+================ ./scripts/playground.py ================
+"""
+Scratchpad for hand-checking row-reduction steps of an augmented matrix.
+
+Used during development to verify Gaussian-elimination calculations done
+on paper; not part of the simulation pipeline.
+"""
+
+import numpy as np
+
+
+def main():
+    """Apply a few row operations to a fixed augmented matrix and print it."""
+    A = np.array([
+        [1, 0, -1, 0, 3, 1, 156],
+        [0, 1, 5/4, 0, 3/4, -1/4, 15],
+        [0, 0, -1/2, 1, -1/2, 1/2, 6]
+    ], dtype=float)
+
+    # Normalise R2's pivot to 1, then clear it from R1 and R3.
+    A[1] = A[1] / (5/4)
+    A[0] = A[0] + A[1]
+    A[2] = A[2] + (A[1] / 2)
+
+    print(A)
+
+
+if __name__=="__main__":
+    main()
+
+
+
+================ ./single_qubit.py ================
+"""
+Top-level simulation: drive a quantised transmon with an SFQ pulse train.
+
+Pipeline
+--------
+1. **Build** the lumped-element circuit (DC SQUID + shunt + coupling).
+2. **Quantise** it: form the charge-basis Hamiltonian, diagonalise, and
+   transform the charge operator into the energy basis.
+3. **Synthesise** a Gaussian SFQ pulse train (or load an RCSJ-derived one
+   from ``sfq_V_lookup.csv``).
+4. **Evolve** the qubit under ``H_0 + H_D(t)`` using the Crank–Nicolson
+   solver.
+5. **Plot** the lowest three energy-level populations vs time.
+
+Run with::
+
+    python main.py
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from constants import e, h, REDUCED_FLUX_QUANTUM
+from config import NUM_KICKS, AMPLITUDE_SCALE, DETUNING, STEPS_PER_PERIOD, SIGMA
+from Node import Node
+from DCSQUID import DCSQUID
+from Transmon import Transmon
+from System import System
+from Quantize import quantize
+from CrankNicolson import CrankNicolsonSolver
+from Wavefunction import Wavefunction
+from utils import create_gaussian_sfq_pulses
+
+
+def main():
+    """Run the end-to-end transmon-driving simulation."""
+    # ------------------------ Hyperparameters ------------------------
+    # Charge basis size; states run from -(n-1)/2 to +(n-1)/2.  Must be
+    # odd so the basis is symmetric around zero.
+    n_charge = 101
+    n_trunc  = n_charge
+
+    # SQUID + drive parameters.
+    external_flux        = 0.130 * REDUCED_FLUX_QUANTUM
+    shunt_capacitance    = 70e-15   # [F]
+    coupling_capacitance = 1e-15    # [F]
+
+    # Junction parameters.  Asymmetric junctions give a flux-tunable but
+    # finite minimum E_J.
+    left_jj_capacitance    = 0
+    left_josephson_energy  = 7e-9  * REDUCED_FLUX_QUANTUM  # [J]
+    right_jj_capacitance   = 0
+    right_josephson_energy = 21e-9 * REDUCED_FLUX_QUANTUM  # [J]
+
+    # ---- Build Ground Node ----
+    gnd = Node()
+
+    # ---- Build DCSQUID Circuit Object ----
+    dcsquid = DCSQUID(
+        ground_node=gnd,
+        left_jj_capacitance=left_jj_capacitance,
+        left_josephson_energy=left_josephson_energy,
+        right_jj_capacitance=right_jj_capacitance,
+        right_josephson_energy=right_josephson_energy
+    )
+    
+    # ---- Build Transmon Circuit Object ----
+    transmon = Transmon(
+        dcsquid=dcsquid,
+        shunt_capacitance=shunt_capacitance,
+        coupling_capacitance=coupling_capacitance
+    )
+
+    # ---- Partition Circuit Nodes and Build Capacitance/Inverse Inductance Matrices
+    transmon.build()
+    
+    print("Capacitance Matrix [fF]:")
+    print(transmon.capacitance_matrix * 1e15)
+    
+    # ---- Retrieve Transmon Charging Energy ----
+    EC = transmon.charging_energy
+    
+    # ---- Retrieve Transmon Josephson Energy (From DCSQUID) ----
+    EJ = DCSQUID.calculate_effective_josephson_energy(
+        left_josephson_energy=left_josephson_energy,
+        right_josephson_energy=right_josephson_energy,
+        external_flux=external_flux
+    )
+
+    print(f"EC = {EC}  EJ = {EJ}  EJ/EC = {EJ/EC}")
+
+    # ---- Quantize ----
+    transmon_subsystem = quantize(
+        circuit=transmon, 
+        external_flux=external_flux, 
+        n_charge=n_charge,
+    )
+    
+    system = System(
+        circuit=transmon,
+        subsystems=[transmon_subsystem],
+        n_charge=n_charge,
+        n_trunc=n_trunc
+    )
+    
+    print("Idling Hamiltonian: ")
+    print(system.hamiltonian(external_flux))
+    
+    # ---- Qubit Frequency ----
+    f_01 = (transmon_subsystem.H0["energy"][1][1] - transmon_subsystem.H0["energy"][0][0]) / h
+    
+    # ---- Qubit Angular Frequency ----
+    omega_01 = 2 * np.pi * f_01
+    
+    # ---- System Anharmonicity ----
+    alpha    = (transmon_subsystem.H0["energy"][2][2] - transmon_subsystem.H0["energy"][1][1]) \
+             - (transmon_subsystem.H0["energy"][1][1] - transmon_subsystem.H0["energy"][0][0])
+    print(f"f_01 = {f_01/1e9:.4f} GHz  |  alpha = {alpha/h/1e6:.2f} MHz")
+
+    # ---- Drive ----
+    # Start in the ground state of the energy basis: amplitude 1 on |0>.
+    initial_state = Wavefunction(basis_to_coefs={"energy": np.array([1] + [0] * (n_charge - 1))})
+    solver        = CrankNicolsonSolver()
+
+    # To use the SFQ lookup table instead of Gaussians, uncomment:
+    # lookup = pd.read_csv("sfq_V_lookup.csv")
+    # time, external_voltage = lookup["time_s"].to_numpy(), lookup["voltage_V"].to_numpy()
+
+    time, external_voltage = create_gaussian_sfq_pulses(
+        num_kicks=NUM_KICKS,
+        amplitude_scale=AMPLITUDE_SCALE,
+        driving_period=(1 / f_01) + DETUNING,
+        pulse_width=SIGMA,
+        steps_per_period=STEPS_PER_PERIOD
+    )
+
+    # ---- Evolve ----
+    final_state, P0, P1, P2 = solver.solve(
+        system=system,
+        initial_state=initial_state,
+        external_voltage=external_voltage,
+        time=time,
+        k=0
+    )
+
+    # ---- Plot ground / first / second level populations vs time ----
+    plt.plot(time, P0, label='P0')
+    plt.plot(time, P1, label='P1')
+    plt.plot(time, P2, label='P2')
+    plt.legend()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================ ./System.py ================
+"""
+Bundled quantum description of a circuit.
+
+A :class:`System` packages everything the time-evolution stage needs:
+
+* the underlying :class:`~Circuit.Circuit` (used for accessing the
+  capacitance matrix and coupling capacitance during driving),
+* the **charge operator** ``n``, in both the charge and energy bases, and
+* the **bare Hamiltonian** ``H0``, again in both bases.
+
+It is the output of :func:`Quantize.quantize_transmon` and the input to
+:class:`CrankNicolson.CrankNicolsonSolver`.
+"""
+
+import numpy as np
+
+from Circuit import Circuit
+from DCSQUID import DCSQUID
+from Operator import Operator
+from constants import h
+
+class SubSystem():
+    def __init__(self, circuit: Circuit, charge_operator: Operator, unperturbed_hamiltonian: Operator):
+        self.circuit = circuit
+        self.n       = charge_operator
+        self.H0      = unperturbed_hamiltonian
+        
+class System():
+    """Quantised circuit ready for time evolution.
+
+    Parameters
+    ----------
+    circuit : Circuit
+        The lumped-element circuit (typically a :class:`~Transmon.Transmon`).
+    charge_operator : Operator
+        The dimensionless Cooper-pair number operator ``n`` in the charge
+        basis and (after :func:`Quantize.quantize_transmon` runs) in the
+        energy eigenbasis.
+    unperturbed_hamiltonian : Operator
+        The bare (drive-free) Hamiltonian ``H_0``.  Diagonal in the energy
+        basis by construction.
+
+    Attributes
+    ----------
+    state : Wavefunction or None
+        Optional slot for the current quantum state during evolution.
+        Initialised to ``None`` and left to callers to populate.
+    """
+    def __init__(self, circuit: Circuit, subsystems: list[SubSystem], n_charge: int, n_trunc: int):
+        self.circuit    = circuit
+        self.subsystems = subsystems
+        self.n_charge   = n_charge
+        self.n_trunc    = n_trunc
+        self.n_full     = n_trunc**(len(self.subsystems))
+        self.state      = None
+        
+        # --- upgrade subsystems to full tensor product space ---
+        self.upgraded_subsystems = [self.upgrade(i, s) for (i,s) in enumerate(self.subsystems)]
+            
+        # --- coupling Hamiltonian ---
+        HC = np.zeros((self.n_full, self.n_full))
+        
+        for k in range(len(self.subsystems)):
+            for l in range(len(self.subsystems)):
+                if k == l:
+                    continue
+                
+                HC += 4 * self.upgraded_subsystems[k].n["energy"] * self.circuit.charging_energy_matrix[k][l] \
+                    @ self.upgraded_subsystems[l].n["energy"]
+                    
+        self.HC = Operator(
+            basis_to_matrix={"energy": HC}
+        )
+                    
+        # --- joint unperturbed/bare Hamiltonian ---
+        H0 = sum(s.H0["energy"] for s in self.upgraded_subsystems) + self.HC["energy"]
+
+        self.H0 = Operator(
+            basis_to_matrix={"energy": H0}
+        )
+        
+        # --- diagonalize unperturbed/bare Hamiltonian ---
+        self.energies, self.energy_states = np.linalg.eigh(self.H0["energy"])
+        
+        # --- construct logical basis ---
+        if len(self.subsystems) == 1:
+            # no logical basis needed, eigenstates are the computational states
+            self.logical_basis = self.energy_states[:, :n_trunc]  # first n_trunc eigenstates as columns
+            
+            E_0 = self.energies[0]
+            E_1 = self.energies[1]
+            self.frequencies = np.array([(E_1 - E_0) / h])
+            self.angular_frequencies = 2 * np.pi * self.frequencies
+        elif len(self.subsystems) == 3:
+            self.logical_basis = np.zeros((self.n_full, 4))
+        
+            # bare reference states in the simulation basis
+            def bare(i, j, k):
+                return np.kron(np.kron(np.eye(self.n_trunc)[i], np.eye(self.n_trunc)[j]), np.eye(self.n_trunc)[k])
+
+            bare_000 = bare(0, 0, 0)
+            bare_101 = bare(1, 0, 1)
+            bare_100 = bare(1, 0, 0)
+            bare_001 = bare(0, 0, 1)
+
+            # |00>_L: ground state, sign-fixed
+            psi_0 = self.energy_states[:, 0]
+            self.logical_basis[:, 0] = np.sign(bare_000 @ psi_0) * psi_0
+
+            # |11>_L: eigenstate with max overlap on |101>, sign-fixed
+            overlaps_101 = bare_101 @ self.energy_states
+            idx_11 = np.argmax(np.abs(overlaps_101))
+            psi_11 = self.energy_states[:, idx_11]
+            self.logical_basis[:, 3] = np.sign(bare_101 @ psi_11) * psi_11
+
+            # |10>_L, |01>_L: Löwdin on the degenerate subspace
+            # find the two eigenstates with largest overlap on span{|100>, |001>}
+            overlap_100 = bare_100 @ self.energy_states  # shape (n_eigenstates,)
+            overlap_001 = bare_001 @ self.energy_states
+            total_overlap = overlap_100**2 + overlap_001**2
+            # exclude indices already used
+            total_overlap[0] = 0.0
+            total_overlap[idx_11] = 0.0
+            # pick top 2
+            degen_indices = np.argsort(total_overlap)[-2:]
+            P = self.energy_states[:, degen_indices]  # shape (n_full, 2), columns span the degenerate eigenspace
+
+            # project bare states into eigenspace: |phi_tilde_i> = P P^T |phi_i>
+            phi_tilde_1 = P @ (P.T @ bare_100)  # projection of |100> into eigenspace
+            phi_tilde_2 = P @ (P.T @ bare_001)  # projection of |001> into eigenspace
+
+            # overlap matrix S_ij = <phi_tilde_i | phi_tilde_j>
+            S = np.array([
+                [phi_tilde_1 @ phi_tilde_1, phi_tilde_1 @ phi_tilde_2],
+                [phi_tilde_2 @ phi_tilde_1, phi_tilde_2 @ phi_tilde_2]
+            ])
+
+            # S^{-1/2}
+            eigvals, eigvecs = np.linalg.eigh(S)
+            S_inv_sqrt = eigvecs @ np.diag(eigvals**(-0.5)) @ eigvecs.T
+
+            # Löwdin orthogonalized states: |phi^L_i> = sum_j (S^{-1/2})_{ji} |phi_tilde_j>
+            phi_tilde = np.column_stack([phi_tilde_1, phi_tilde_2])  # shape (n_full, 2)
+            phi_lowdin = phi_tilde @ S_inv_sqrt  # shape (n_full, 2)
+
+            # |10>_L = phi_lowdin[:, 0], sign-fixed against |100>
+            self.logical_basis[:, 2] = np.sign(bare_100 @ phi_lowdin[:, 0]) * phi_lowdin[:, 0]
+            # |01>_L = phi_lowdin[:, 1], sign-fixed against |001>
+            self.logical_basis[:, 1] = np.sign(bare_001 @ phi_lowdin[:, 1]) * phi_lowdin[:, 1]
+            
+            # --- dressed Hamiltonian ---
+            self.H0["energy_dressed"] = np.diag(self.energies)
+            
+            # --- extract qubit frequencies from logical basis energies ---
+            E_00 = self.logical_basis[:, 0] @ self.H0["energy"] @ self.logical_basis[:, 0]
+            E_10 = self.logical_basis[:, 2] @ self.H0["energy"] @ self.logical_basis[:, 2]
+            E_01 = self.logical_basis[:, 1] @ self.H0["energy"] @ self.logical_basis[:, 1]
+            
+            self.frequencies = np.array([
+                (E_10 - E_00) / h, # qubit 1 frequency
+                (E_01 - E_00) / h  # qubit 2 frequency
+            ])
+            self.angular_frequencies = 2 * np.pi * self.frequencies
+        
+    # def hamiltonian(self, external_flux: np.ndarray):
+    #     josephson_energies = DCSQUID.calculate_effective_josephson_energy(
+    #         left_josephson_energy=self.dcsquid.left_josephson_energy,
+    #         right_josephson_energy=self.dcsquid.right_josephson_energy,
+    #         external_flux=external_flux
+    #     )
+        
+    #     H0 = sum(s.circuit.hamiltonian(external_flux[k]) for (k, s) in enumerate(self.upgraded_subsystems))
+    
+    def upgrade(self, k: int, subsystem: SubSystem):
+        n_truncated = subsystem.n.truncate(self.n_trunc)
+        n_upgraded  = n_truncated.upgrade(
+            k=k,
+            num_subsystems=len(self.subsystems),
+            dim=self.n_trunc # the dimension of each subsystems Hilbert space
+        )
+        
+        H0_truncated = subsystem.H0.truncate(self.n_trunc)
+        H0_upgraded  = H0_truncated.upgrade(
+            k=k,
+            num_subsystems=len(self.subsystems),
+            dim=self.n_trunc
+        )
+        
+        upgraded_subsystem = SubSystem(
+            circuit=subsystem.circuit,
+            charge_operator=n_upgraded,
+            unperturbed_hamiltonian=H0_upgraded
+        )
+        
+        return upgraded_subsystem
+
+
+================ ./Transmon.py ================
+"""
+Transmon circuit: a flux-tunable DC SQUID shunted by a large capacitor.
+
+The :class:`Transmon` wraps a :class:`~DCSQUID.DCSQUID` and adds two
+extra capacitors between the SQUID island and ground:
+
+* a large **shunt capacitance** ``C_s`` that suppresses charge dispersion
+  and pushes the qubit into the transmon regime ``E_J / E_C >> 1``, and
+* a small **coupling capacitance** ``C_g`` that lets an external voltage
+  drive the island.
+
+The combined topology is forwarded to :class:`~Circuit.Circuit`, which
+constructs the reduced capacitance matrix used downstream by
+:func:`Quantize.quantize_transmon`.
+"""
+
+import numpy as np
+
+from Circuit import Circuit
+from DCSQUID import DCSQUID
+from Branch import Capacitor
+from Graph import Multidigraph
+from constants import e
+from Expression import *
+
+
+class Transmon(Circuit):
+    """Transmon qubit built on top of an existing DC SQUID.
+
+    Parameters
+    ----------
+    dcsquid : DCSQUID
+        Pre-built SQUID providing the non-linear inductive element and the
+        ground/island nodes.
+    shunt_capacitance : float
+        Shunt capacitance ``C_s`` between island and ground, in Farads.
+        This is typically the dominant capacitance in the circuit and sets
+        the charging energy ``E_C = e^2 / (2 C_\Sigma)``.
+    coupling_capacitance : float
+        Coupling capacitance ``C_g`` between island and ground (representing
+        coupling to an external drive line), in Farads.  Used in the drive
+        Hamiltonian as the coupling efficiency ``C_g / C_\Sigma``.
+    """
+
+    def __init__(self, dcsquid: DCSQUID, shunt_capacitance: float, coupling_capacitance: float):
+
+        self.dcsquid = dcsquid
+        self.island = self.dcsquid.island
+                
+        self.shunt_capacitance    = shunt_capacitance
+        self.coupling_capacitance = coupling_capacitance
+
+        # Extra capacitors that distinguish a transmon from a bare SQUID:
+        # a big shunt to set E_C, and a small coupling capacitor that the
+        # external drive enters through.
+        shunt_capacitor = Capacitor(self.shunt_capacitance)
+        coupling_capacitor = Capacitor(self.coupling_capacitance)
+
+        # Combined topology: the SQUID branches plus the two new shunt-
+        # to-ground capacitors, all oriented ground -> island.
+        graph = Multidigraph(
+            nodes=dcsquid.nodes,
+            branches=dcsquid.branches + [shunt_capacitor] + [coupling_capacitor],
+            s=dcsquid.s + [self.dcsquid.gnd._id] * 2,
+            t=dcsquid.t + [self.dcsquid.island._id] * 2
+        )
+                
+        super().__init__(graph)
+        
+    def hamiltonian(self, charging_energy: float, external_flux: float):
+        EJ = DCSQUID.calculate_effective_josephson_energy(
+            left_josephson_energy=self.dcsquid.left_josephson_energy,
+            right_josephson_energy=self.dcsquid.right_josephson_energy,
+            external_flux=external_flux
+        )
+        return Scalar(4) * Scalar(charging_energy) * ( Op("n")**Scalar(2) ) + Scalar(-EJ) * Cos(Op("phi"))
+
+
+
+================ ./utils.py ================
+"""
+Helpers for synthesising drive waveforms.
+
+Currently provides a Gaussian SFQ pulse-train generator used by the main
+simulation entry point.  An alternative, physically-realistic SFQ waveform
+generator based on the RCSJ model is provided in :mod:`riyas_pulses`, which
+writes a CSV lookup table that can be loaded in :mod:`main` instead.
+"""
+
+import numpy as np
+from scipy.linalg import expm
+
+
+def create_gaussian_sfq_pulses(num_kicks: int, amplitude_scale: float, driving_period: float, pulse_width: float, steps_per_period):
+    r"""Generate a uniformly-sampled train of Gaussian SFQ-like pulses.
+
+    The resulting waveform is the sum of ``num_kicks`` Gaussians spaced by
+    ``driving_period`` seconds, each with standard deviation
+    ``pulse_width`` and peak amplitude ``amplitude_scale``:
+
+    .. math::
+
+        V(t) = A \sum_{k=0}^{N-1}
+                \exp\!\Big( -\tfrac{(t - k\,T_d)^2}{(2\,\sigma)^2} \Big)
+
+    Parameters
+    ----------
+    num_kicks : int
+        Number of Gaussian kicks ``N`` in the train.
+    amplitude_scale : float
+        Peak amplitude ``A`` of each Gaussian (Volts).  Typically chosen
+        so that the time integral of each pulse equals the reduced flux
+        quantum (see :data:`config.AMPLITUDE_SCALE`).
+    driving_period : float
+        Spacing ``T_d`` between successive pulses, in seconds.
+    pulse_width : float
+        Gaussian standard deviation ``\sigma``, in seconds.
+    steps_per_period : int
+        Number of time samples used to discretise each ``driving_period``.
+
+    Returns
+    -------
+    time : np.ndarray
+        Uniformly spaced time grid of length ``num_kicks * steps_per_period``.
+    voltage : list[float]
+        Voltage samples on that grid.
+
+    Notes
+    -----
+    The function uses :func:`scipy.linalg.expm` on a scalar exponent rather
+    than :func:`numpy.exp`; for scalar inputs the two are mathematically
+    equivalent and the result is a 0-d array that matplotlib accepts.
+    """
+    total_time = num_kicks * driving_period
+    num_steps  = int(num_kicks * steps_per_period)
+    dt = total_time / num_steps
+
+    voltage = []
+    time = np.arange(num_steps) * dt
+
+    for i in range(num_steps):
+        t = i * dt
+
+        # Sum of Gaussians centred at t = k * T_d for k = 0, ..., N-1.
+        v = 0
+        for k in range(num_kicks):
+            numerator   = -(t - (k * driving_period))**2
+            denominator = (2 * pulse_width)**2
+            v += expm(numerator / denominator)
+
+        v *= amplitude_scale
+        voltage.append(v)
+
+    return time, voltage
+
+
+================ ./Wavefunction.py ================
+"""
+Wavefunction container that mirrors the multi-basis design of
+:class:`~Operator.Operator`.
+
+A :class:`Wavefunction` keeps an array of complex amplitudes for each basis
+it is expressed in (``"energy"``, ``"charge"``, …).  Each basis also carries
+an associated unitary :class:`~Operator.Operator` ``U`` that records the
+transformation from the original basis (initialised to identity), allowing
+sequential operator applications to be tracked.
+"""
+
+import numpy as np
+
+from Operator import Operator
+
+
+class Wavefunction():
+    """A quantum state expressed as amplitude vectors in one or more bases.
+
+    Parameters
+    ----------
+    basis_to_coefs : dict[str, np.ndarray]
+        Mapping from basis label to the complex coefficient vector of the
+        state in that basis.
+
+    Attributes
+    ----------
+    U : Operator
+        Cumulative unitary transformations applied to the wavefunction in
+        each basis.  Initialised to the identity for every basis present in
+        ``basis_to_coefs``.
+    """
+
+    def __init__(self, basis_to_coefs: dict[str, np.ndarray]) -> None:
+        self._basis_to_coefs = basis_to_coefs
+
+        # Track the cumulative unitary transformation in each basis so that
+        # callers can recover the propagator after an evolution loop.
+        self.U = Operator({})
+        for basis, coefs in self._basis_to_coefs.items():
+            n = len(coefs)
+            self.U[basis] = np.eye(n)
+
+    def __getitem__(self, basis):
+        """Return the coefficient vector in the requested basis."""
+        return self._basis_to_coefs[basis]
+
+    def __setitem__(self, basis, coefs) -> None:
+        """Replace the coefficient vector in the given basis."""
+        self._basis_to_coefs[basis] = coefs
+
+    def apply(self, operator: Operator):
+        """Apply ``operator`` to the wavefunction in every shared basis.
+
+        For each basis present on this wavefunction, multiplies the
+        coefficient vector by the matrix representation of ``operator`` in
+        that basis.
+
+        Parameters
+        ----------
+        operator : Operator
+            Operator whose matrix in each basis acts on the corresponding
+            coefficient vector.
+        """
+        for basis, coefs in self._basis_to_coefs:
+            matrix = operator[basis]
+            new_coefs = matrix @ coefs
+            self[basis] = new_coefs
+
+
+

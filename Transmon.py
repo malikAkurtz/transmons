@@ -44,10 +44,11 @@ class Transmon(Circuit):
 
     def __init__(self, dcsquid: DCSQUID, shunt_capacitance: float, coupling_capacitance: float):
 
+        self.dcsquid = dcsquid
+        self.island = self.dcsquid.island
+                
         self.shunt_capacitance    = shunt_capacitance
         self.coupling_capacitance = coupling_capacitance
-
-        self.dcsquid = dcsquid
 
         # Extra capacitors that distinguish a transmon from a bare SQUID:
         # a big shunt to set E_C, and a small coupling capacitor that the
@@ -63,17 +64,13 @@ class Transmon(Circuit):
             s=dcsquid.s + [self.dcsquid.gnd._id] * 2,
             t=dcsquid.t + [self.dcsquid.island._id] * 2
         )
-        
-        self.total_capacitance = np.array([b.capacitance for b in graph.branches if isinstance(b, Capacitor)]).sum()
-        
-        self.charging_energy = (e**2) / (2 * self.total_capacitance)
-
+                
         super().__init__(graph)
         
-    def hamiltonian(self, external_flux: float):
+    def hamiltonian(self, charging_energy: float, external_flux: float):
         EJ = DCSQUID.calculate_effective_josephson_energy(
             left_josephson_energy=self.dcsquid.left_josephson_energy,
             right_josephson_energy=self.dcsquid.right_josephson_energy,
             external_flux=external_flux
         )
-        return Scalar(4) * Scalar(self.charging_energy) * ( Op("n")**Scalar(2) ) + Scalar(-EJ) * Cos(Op("phi"))
+        return Scalar(4) * Scalar(charging_energy) * ( Op("n")**Scalar(2) ) + Scalar(-EJ) * Cos(Op("phi"))

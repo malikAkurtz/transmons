@@ -31,7 +31,7 @@ import numpy as np
 
 from Graph import Multidigraph
 from Branch import Capacitor, Inductor, JosephsonElement
-
+from constants import e
 
 class Circuit():
     """A lumped-element circuit built from a topology graph.
@@ -64,9 +64,11 @@ class Circuit():
         self.s        = graph.s
         self.t        = graph.t
 
-        self.active_nodes, self.passive_nodes  = None, None
-        self.P = None
+        self.active_nodes, self.passive_nodes               = None, None
+        self.P                                              = None
         self.capacitance_matrix, self.inv_inductance_matrix = None, None
+        self.inv_capacitance_matrix                         = None
+        self.charging_energy_matrix                         = None
 
     def _partition_nodes(self):
         """Classify each non-ground node as *active* or *passive*.
@@ -150,12 +152,13 @@ class Circuit():
         :attr:`inv_inductance_matrix` are read.
         """
         self._partition_nodes()
-        self.P = len(self.active_nodes) + len(self.passive_nodes) + 1
+        self.P                      = len(self.active_nodes) + len(self.passive_nodes) + 1
         self._build_matrices()
+        self.inv_capacitance_matrix = np.linalg.inv(self.capacitance_matrix)
+        self.charging_energy_matrix = ((e**2) / 2) * self.inv_capacitance_matrix
         
     def hamiltonian(self):
         pass
-
 
     def __str__(self):
         """Human-readable list of the branches in the circuit.

@@ -42,7 +42,7 @@ class CrankNicolsonSolver():
     def __init__(self):
         pass
 
-    def solve(self, system: System, initial_state: Wavefunction, external_voltage: np.ndarray, time: float):
+    def solve(self, system: System, initial_state: Wavefunction, external_voltage: np.ndarray, time: float, k: int):
         r"""Evolve ``initial_state`` under ``H_0 + H_D(t)``.
 
         Parameters
@@ -61,6 +61,8 @@ class CrankNicolsonSolver():
         time : np.ndarray
             Uniformly-spaced time grid in seconds.  The step size is taken
             to be ``time[1] - time[0]``.
+        k : int
+            The index of the subsystem we want to evolve with Crank Nicolson.
 
         Returns
         -------
@@ -96,7 +98,11 @@ class CrankNicolsonSolver():
 
             # Drive Hamiltonian:
             #   H_D = 2e * (C_g / C_\Sigma) * V(t) * \hat n
-            HD_midpoint = (2 * e) * (system.circuit.coupling_capacitance / system.circuit.capacitance_matrix[0][0]) * voltage_midpoint * system.n["energy"]
+            HD_midpoint = np.zeros((system.n_full, system.n_full))
+            n_e_k = system.subsystems[k].circuit.coupling_capacitance * external_voltage / (2 * e)
+            
+            for l in range(len(system.subsystems)):
+                HD += -8 * n_e_k * system.circuit.charging_energy_matrix[k][l] * system.upgraded_subsystems[l].n["energy"]
 
             H = system.H0["energy"] + HD_midpoint
 

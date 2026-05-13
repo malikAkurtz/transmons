@@ -21,14 +21,14 @@ The result is bundled into a :class:`~System.System` for downstream use by
 
 import numpy as np
 
-from System import System
+from System import System, SubSystem
 from Circuit import Circuit
 from Operator import Operator
 from constants import e
 from Expression import *
 
 
-def quantize(circuit: Circuit, external_flux: float, n_charge: int):
+def quantize(circuit: Circuit, charging_energy: float, external_flux: float, n_charge: int):
     r"""Quantise a transmon and return a ready-to-evolve :class:`System`.
 
     Parameters
@@ -62,7 +62,7 @@ def quantize(circuit: Circuit, external_flux: float, n_charge: int):
     # Bare Hamiltonian in the charge basis.
     H0 = Operator(
         basis_to_matrix={"charge":  Expression.realize(
-            expression=circuit.hamiltonian(external_flux),
+            expression=circuit.hamiltonian(charging_energy, external_flux),
             n_charge=n_charge
             )
         }
@@ -77,10 +77,10 @@ def quantize(circuit: Circuit, external_flux: float, n_charge: int):
     H0["energy"] = np.diag(energies)
     n["energy"] = energy_states.conj().T @ n["charge"] @ energy_states
 
-    system = System(
+    subsystem = SubSystem(
         circuit=circuit,
         charge_operator=n,
         unperturbed_hamiltonian=H0
     )
 
-    return system
+    return subsystem

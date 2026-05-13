@@ -68,5 +68,28 @@ class Operator():
         
         return new_op
         
+    def truncate(self, dim: int) -> Operator:
+        truncated_op = Operator({})
+        
+        for basis, matrix in self._basis_to_matrix.items():
+            truncated_op[basis] = matrix[:dim, :dim]
+            
+        return truncated_op
+    
+    def upgrade(self, k: int, num_subsystems: int, dim: int):
+        upgraded_op = Operator({})
+        
+        for basis, matrix in self._basis_to_matrix.items():
+            factors = [np.eye(dim) for _ in range(num_subsystems)]
+            factors[k] = matrix
+            
+            result = factors[0]
+            for f in factors[1:]:
+                result = np.kron(result, f)
+                
+            upgraded_op[basis] = result
+                        
+        return upgraded_op
+            
         
             
