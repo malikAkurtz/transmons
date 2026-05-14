@@ -59,10 +59,9 @@ class Circuit():
     """
 
     def __init__(self, graph: Multidigraph):
+        self.graph    = graph
         self.nodes    = graph.nodes
         self.branches = graph.branches
-        self.s        = graph.s
-        self.t        = graph.t
 
         self.active_nodes, self.passive_nodes               = None, None
         self.P                                              = None
@@ -92,7 +91,7 @@ class Circuit():
                 if node in self.active_nodes or node in self.passive_nodes:
                     continue
                 
-                if not node in [self.s(branch), self.t(branch)]:
+                if not node in [self.graph.s(branch), self.graph.t(branch)]:
                     continue
 
                 # A node attached to *any* inductive element is active.
@@ -122,29 +121,19 @@ class Circuit():
         # whose endpoints are {i, j}.
         
         for branch in self.branches:
-            source_node   = self.s(branch)
-            terminal_node = self.t(branch)
+            source_node   = self.graph.s(branch)
+            terminal_node = self.graph.t(branch)
             
             source_node_idx   = self.node_to_idx[source_node]
             terminal_node_idx = self.node_to_idx[terminal_node]
             
             if isinstance(branch, Capacitor):
                 self.capacitance_matrix[source_node_idx][terminal_node_idx] -= branch.capacitance
+                self.capacitance_matrix[terminal_node_idx][source_node_idx] -= branch.capacitance
             elif isinstance(branch, Inductor):
-                self.inv_inductance_matrix -= (1/branch.inductance)
-        
-        
-        for i in range(self.P):
-            for j in range(self.P):
-                # we populate the diagonals later
-                if i == j:
-                    continue
-                
-                for branch in self.branches:
-                    if set([i, j]) == set():
+                self.inv_inductance_matrix[source_node_idx][terminal_node_idx] -= (1/branch.inductance)
+                self.inv_inductance_matrix[terminal_node_idx][source_node_idx] -= (1/branch.inductance)
                         
-                        
-
         # Diagonal entries: enforce row-sum = 0 (i.e. each node's self-term
         # equals the sum of magnitudes of its connections).
         for i in range(self.P):
@@ -190,6 +179,6 @@ class Circuit():
             elif isinstance(branch, JosephsonElement):
                 type = "Josephson Element"
             rep += f"Branch: {branch._id}, {type}" + "\n"
-            rep += f"{self.s[branch._id]} --> {self.t[branch._id]}" + "\n"
+            rep += f"{self.graph.s(branch._id)} --> {self.graph.t(branch._id)}" + "\n"
             rep += "-" * 20 + "\n"
         return rep

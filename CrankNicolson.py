@@ -96,13 +96,12 @@ class CrankNicolsonSolver():
             # of the time-dependent drive Hamiltonian on the interval.
             voltage_midpoint = (external_voltage[i] + external_voltage[i+1]) / 2
 
-            # Drive Hamiltonian:
-            #   H_D = 2e * (C_g / C_\Sigma) * V(t) * \hat n
-            HD_midpoint = np.zeros((system.n_full, system.n_full))
-            n_e_k = system.subsystems[k].circuit.coupling_capacitance * external_voltage / (2 * e)
+            n_e_k = system.subsystems[k].circuit.coupling_capacitance * voltage_midpoint / (2 * e)
             
+            HD_midpoint = np.zeros((system.n_full, system.n_full))
+
             for l in range(len(system.subsystems)):
-                HD += -8 * n_e_k * system.circuit.charging_energy_matrix[k][l] * system.upgraded_subsystems[l].n["energy"]
+                HD_midpoint += -8 * n_e_k * system.circuit.charging_energy_matrix[k][l] * system.upgraded_subsystems[l].n["energy"]
 
             H = system.H0["energy"] + HD_midpoint
 
@@ -115,8 +114,8 @@ class CrankNicolsonSolver():
             state["energy"] = np.linalg.solve(A, B @ state["energy"])
 
             # Record level populations at the new time.
-            P0[i] = np.abs(state["energy"][0])**2
-            P1[i] = np.abs(state["energy"][1])**2
-            P2[i] = np.abs(state["energy"][2])**2
+            P0[i] = np.abs(system.logical_basis[:, 0] @ state["energy"])**2
+            P1[i] = np.abs(system.logical_basis[:, 1] @ state["energy"])**2
+            P2[i] = np.abs(system.logical_basis[:, 2] @ state["energy"])**2
 
         return state, P0, P1, P2

@@ -66,3 +66,7 @@ class Wavefunction():
             matrix = operator[basis]
             new_coefs = matrix @ coefs
             self[basis] = new_coefs
+
+    def copy(self):
+        new_coefs = {basis: coefs.copy() for basis, coefs in self._basis_to_coefs.items()}
+        return Wavefunction(basis_to_coefs=new_coefs)

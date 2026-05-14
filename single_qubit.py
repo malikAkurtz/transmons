@@ -31,6 +31,12 @@ from Quantize import quantize
 from CrankNicolson import CrankNicolsonSolver
 from Wavefunction import Wavefunction
 from utils import create_gaussian_sfq_pulses
+from Graph import Multidigraph
+from Circuit import Circuit
+from scipy.signal import find_peaks
+from scipy.ndimage import uniform_filter1d
+from Matrices import get_RX_target, get_RY_target
+from fidelity import *
 
 
 def main():
@@ -39,19 +45,21 @@ def main():
     # Charge basis size; states run from -(n-1)/2 to +(n-1)/2.  Must be
     # odd so the basis is symmetric around zero.
     n_charge = 101
-    n_trunc  = n_charge
+    n_trunc  = 7
+    
+    # ---- Circuit Paramters ----
+    external_flux_off    = np.array([0.130]) * REDUCED_FLUX_QUANTUM
 
     # SQUID + drive parameters.
-    external_flux        = 0.130 * REDUCED_FLUX_QUANTUM
     shunt_capacitance    = 70e-15   # [F]
     coupling_capacitance = 1e-15    # [F]
 
     # Junction parameters.  Asymmetric junctions give a flux-tunable but
     # finite minimum E_J.
     left_jj_capacitance    = 0
-    left_josephson_energy  = 7e-9  * REDUCED_FLUX_QUANTUM  # [J]
+    left_jj_energy         = 7e-9  * REDUCED_FLUX_QUANTUM  # [J]
     right_jj_capacitance   = 0
-    right_josephson_energy = 21e-9 * REDUCED_FLUX_QUANTUM  # [J]
+    right_jj_energy        = 21e-9 * REDUCED_FLUX_QUANTUM  # [J]
 
     # ---- Build Ground Node ----
     gnd = Node()
@@ -60,67 +68,104 @@ def main():
     dcsquid = DCSQUID(
         ground_node=gnd,
         left_jj_capacitance=left_jj_capacitance,
-        left_josephson_energy=left_josephson_energy,
+        left_josephson_energy=left_jj_energy,
         right_jj_capacitance=right_jj_capacitance,
-        right_josephson_energy=right_josephson_energy
+        right_josephson_energy=right_jj_energy
     )
-    
-    # ---- Build Transmon Circuit Object ----
+
     transmon = Transmon(
         dcsquid=dcsquid,
         shunt_capacitance=shunt_capacitance,
         coupling_capacitance=coupling_capacitance
     )
-
-    # ---- Partition Circuit Nodes and Build Capacitance/Inverse Inductance Matrices
-    transmon.build()
     
-    print("Capacitance Matrix [fF]:")
-    print(transmon.capacitance_matrix * 1e15)
+    transmons = [transmon]
     
-    # ---- Retrieve Transmon Charging Energy ----
-    EC = transmon.charging_energy
+    # ---- Create New Nodes List ----
+    nodes = [gnd, transmon.island]
     
-    # ---- Retrieve Transmon Josephson Energy (From DCSQUID) ----
-    EJ = DCSQUID.calculate_effective_josephson_energy(
-        left_josephson_energy=left_josephson_energy,
-        right_josephson_energy=right_josephson_energy,
-        external_flux=external_flux
-    )
-
-    print(f"EC = {EC}  EJ = {EJ}  EJ/EC = {EJ/EC}")
-
-    # ---- Quantize ----
-    transmon_subsystem = quantize(
-        circuit=transmon, 
-        external_flux=external_flux, 
-        n_charge=n_charge,
+    # ---- Create New Branches List ----
+    branches = transmon.branches
+    
+    # ---- Create New Source and Terminal Dicts ----
+    source_dict = {**transmon.graph.source_dict}
+    
+    terminal_dict = {**transmon.graph.terminal_dict}
+    
+    # ---- Create Graph Representation ----
+    graph = Multidigraph(
+        nodes=nodes,
+        branches=branches,
+        source_dict=source_dict,
+        terminal_dict=terminal_dict,
     )
     
+    # ---- Create Multi-Qubit Transmon Circuit ----
+    circuit = Circuit(
+        graph=graph
+    )
+
+    # ---- Partition Circuit Nodes and Build Capacitance/Inverse Inductance Matrices ----
+    circuit.build()
+    
+    # ---- Quantize the Circuit Object ----
+    subsystems = [quantize(circuit=t, 
+                           charging_energy=circuit.charging_energy_matrix[k][k],
+                           external_flux=external_flux_off[k], n_charge=n_charge)
+                  for (k, t) in enumerate(transmons)]
+    
+    # ---- Create the System from the SubSystems----
     system = System(
-        circuit=transmon,
-        subsystems=[transmon_subsystem],
+        circuit=circuit,
+        subsystems=subsystems,
         n_charge=n_charge,
         n_trunc=n_trunc
     )
     
-    print("Idling Hamiltonian: ")
-    print(system.hamiltonian(external_flux))
+    print("Capacitance Matrix [fF]:")
+    print(circuit.capacitance_matrix * 1e15)
     
-    # ---- Qubit Frequency ----
-    f_01 = (transmon_subsystem.H0["energy"][1][1] - transmon_subsystem.H0["energy"][0][0]) / h
+    # ---- Retrieve Charging Energies of Each Transmon Circuit ----
+    charging_energies = np.array([circuit.charging_energy_matrix[k][k] for k in range(len(subsystems))])
     
-    # ---- Qubit Angular Frequency ----
-    omega_01 = 2 * np.pi * f_01
-    
-    # ---- System Anharmonicity ----
-    alpha    = (transmon_subsystem.H0["energy"][2][2] - transmon_subsystem.H0["energy"][1][1]) \
-             - (transmon_subsystem.H0["energy"][1][1] - transmon_subsystem.H0["energy"][0][0])
-    print(f"f_01 = {f_01/1e9:.4f} GHz  |  alpha = {alpha/h/1e6:.2f} MHz")
+    # ---- Retrieve Idling Transmon Josephson Energies (From DCSQUID) ----
+    josephson_energies = np.array([DCSQUID.calculate_effective_josephson_energy(
+        left_josephson_energy=t.dcsquid.left_josephson_energy,
+        right_josephson_energy=t.dcsquid.right_josephson_energy,
+        external_flux=external_flux_off[k]
+    ) for (k, t) in enumerate(transmons)])
 
-    # ---- Drive ----
-    # Start in the ground state of the energy basis: amplitude 1 on |0>.
-    initial_state = Wavefunction(basis_to_coefs={"energy": np.array([1] + [0] * (n_charge - 1))})
+    print(f"EC = {charging_energies}  EJ = {josephson_energies}  EJ/EC = {josephson_energies/charging_energies}")
+    
+    print("Idling Hamiltonian: ")
+    print(system.H0["energy"])
+    
+    # ---- Qubit Frequencies ----
+    print("Qubit Frequencies")
+    print(system.frequencies)
+    
+    # ---- Qubit Angular Frequencies ----
+    print("Qubit Angular Frequencies")
+    print(system.angular_frequencies)
+    
+    # ---- Logical Basis ----
+    print("Logical Basis")
+    print(system.logical_basis)
+
+    # ---- Qubit Subsystem Index to Drive ----
+    k = 0
+    
+    # ---- Logical |0> ----
+    z_amps = np.zeros(n_trunc**len(subsystems))
+    z_amps[0] = 1
+    z = Wavefunction(basis_to_coefs={"energy": z_amps})
+    
+    # ---- Logical |1> ----
+    o_amps = np.zeros(n_trunc**len(subsystems))
+    o_amps[1] = 1
+    o  = Wavefunction(basis_to_coefs={"energy": o_amps})
+    
+    # ---- Initialize Solver ----
     solver        = CrankNicolsonSolver()
 
     # To use the SFQ lookup table instead of Gaussians, uncomment:
@@ -130,24 +175,101 @@ def main():
     time, external_voltage = create_gaussian_sfq_pulses(
         num_kicks=NUM_KICKS,
         amplitude_scale=AMPLITUDE_SCALE,
-        driving_period=(1 / f_01) + DETUNING,
+        driving_period=(1 / system.frequencies[k]) + DETUNING,
         pulse_width=SIGMA,
         steps_per_period=STEPS_PER_PERIOD
     )
 
-    # ---- Evolve ----
+    # ---- Save originals ----
+    time_full = time.copy()
+    voltage_full = external_voltage.copy()
+
+    # ---- First evolution (full) ----
     final_state, P0, P1, P2 = solver.solve(
         system=system,
-        initial_state=initial_state,
-        external_voltage=external_voltage,
-        time=time,
-        k=0
+        initial_state=z.copy(),
+        external_voltage=voltage_full,
+        time=time_full,
+        k=k
     )
 
-    # ---- Plot ground / first / second level populations vs time ----
-    plt.plot(time, P0, label='P0')
-    plt.plot(time, P1, label='P1')
-    plt.plot(time, P2, label='P2')
+    # ---- Extract Rabi Period ----
+    P1_smooth = uniform_filter1d(P1, size=STEPS_PER_PERIOD)
+    peak_indices, _ = find_peaks(P1_smooth, prominence=0.1)
+    rabi_half_period = time_full[peak_indices[0]]
+    print("Rabi Half-Period: ", rabi_half_period)
+    
+    # ---- Truncate from originals ----
+    mask = time_full <= (rabi_half_period)
+    time_half = time_full[mask]
+    voltage_half = voltage_full[mask]
+
+    # ---- Second evolution (half Rabi) ----
+    final_state, P0, P1, P2 = solver.solve(
+        system=system,
+        initial_state=z.copy(),
+        external_voltage=voltage_half,
+        time=time_half,
+        k=k
+    )
+    
+    # ---- Compute the Effective Unitary On the Truncated Hilbert Space ----
+    U = np.zeros((n_trunc, n_trunc), dtype=complex)
+    
+    z_evolved, _, _, _ = solver.solve(
+        system=system,
+        initial_state=z.copy(),
+        external_voltage=voltage_half,
+        time=time_half,
+        k=k
+    )
+    
+    o_evolved, _, _, _ = solver.solve(
+        system=system,
+        initial_state=o.copy(),
+        external_voltage=voltage_half,
+        time=time_half,
+        k=k
+    )
+    
+    U[:, 0] = z_evolved["energy"]
+    U[:, 1] = o_evolved["energy"]
+    
+    # ---- Project U Onto the Computational Subspace ----
+    U_q = Operator(basis_to_matrix={"energy": U[:2, :2]})
+    
+    # ---- Calculate Leakage and Fidelity Metrics ----
+    pauli_coefs = get_pauli_coefs(
+        U_q=U_q,
+        basis="energy"
+    )
+    
+    L1 = get_L1(
+        U_q=U_q,
+        basis="energy"
+    )
+    
+    r = get_r(
+        coefs=pauli_coefs,
+    )
+    
+    process_fidelity = get_process_fidelity(
+        U_q=U_q,
+        U_target=get_RY_target(theta_target=np.pi),
+        basis="energy"
+    )
+
+    fidelity = get_average_gate_fidelity(
+        process_fidelity=process_fidelity,
+        L1=L1
+    )
+    
+    print("Gate Fidelity: ")
+    print(fidelity)
+    
+    plt.plot(time_half, P0, label='P0')
+    plt.plot(time_half, P1, label='P1')
+    plt.plot(time_half, P2, label='P2')
     plt.legend()
     plt.show()
 

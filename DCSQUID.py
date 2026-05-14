@@ -84,17 +84,17 @@ class DCSQUID(Circuit):
                          right_jj_capacitor, right_josephson_element]
 
         # All branches share the same orientation: ground -> island.
-        self.s = [self.gnd._id] * len(self.branches)
-        self.t = [self.island._id] * len(self.branches)
+        self.source_dict   = {branch: self.gnd for branch in self.branches}
+        self.terminal_dict = {branch: self.island for branch in self.branches}
 
-        graph = Multidigraph(
+        self.graph = Multidigraph(
             nodes=self.nodes,
             branches=self.branches,
-            s=self.s,
-            t=self.t
+            source_dict=self.source_dict,
+            terminal_dict=self.terminal_dict
         )
 
-        super().__init__(graph)
+        super().__init__(self.graph)
 
     @staticmethod
     def calculate_effective_josephson_energy(left_josephson_energy: float, right_josephson_energy: float, external_flux: float):

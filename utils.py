@@ -9,6 +9,7 @@ writes a CSV lookup table that can be loaded in :mod:`main` instead.
 
 import numpy as np
 from scipy.linalg import expm
+from Matrices import PAULI_MATRICES
 
 
 def create_gaussian_sfq_pulses(num_kicks: int, amplitude_scale: float, driving_period: float, pulse_width: float, steps_per_period):
@@ -66,9 +67,20 @@ def create_gaussian_sfq_pulses(num_kicks: int, amplitude_scale: float, driving_p
         for k in range(num_kicks):
             numerator   = -(t - (k * driving_period))**2
             denominator = (2 * pulse_width)**2
-            v += expm(numerator / denominator)
+            v += np.exp(numerator / denominator)
 
         v *= amplitude_scale
         voltage.append(v)
 
-    return time, voltage
+    return np.array(time), np.array(voltage)
+
+def get_pauli_coefs(U_q: np.ndarray, basis: str):
+        if U_q[basis].shape != (2, 2):
+            raise Exception("Matrix is Not (2 x 2)")
+
+        coefs = np.zeros(len(PAULI_MATRICES), dtype=complex)
+    
+        for idx, matrix in enumerate(PAULI_MATRICES):
+            coefs[idx] = np.trace(matrix @ U_q[basis]) / 2
+            
+        return coefs

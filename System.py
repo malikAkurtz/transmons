@@ -84,7 +84,8 @@ class System():
         
         # --- construct logical basis ---
         if len(self.subsystems) == 1:
-            # no logical basis needed, eigenstates are the computational states
+            # eigenstates are the computational states
+            # NOTE: the columns are the eigenvectors
             self.logical_basis = self.energy_states[:, :n_trunc]  # first n_trunc eigenstates as columns
             
             E_0 = self.energies[0]
@@ -98,10 +99,10 @@ class System():
             def bare(i, j, k):
                 return np.kron(np.kron(np.eye(self.n_trunc)[i], np.eye(self.n_trunc)[j]), np.eye(self.n_trunc)[k])
 
-            bare_000 = bare(0, 0, 0)
-            bare_101 = bare(1, 0, 1)
-            bare_100 = bare(1, 0, 0)
-            bare_001 = bare(0, 0, 1)
+            bare_000 = bare(0, 0, 0) # 0
+            bare_101 = bare(1, 0, 1) # 3
+            bare_100 = bare(1, 0, 0) # 2
+            bare_001 = bare(0, 0, 1) # 1
 
             # |00>_L: ground state, sign-fixed
             psi_0 = self.energy_states[:, 0]
@@ -162,15 +163,6 @@ class System():
             ])
             self.angular_frequencies = 2 * np.pi * self.frequencies
         
-    # def hamiltonian(self, external_flux: np.ndarray):
-    #     josephson_energies = DCSQUID.calculate_effective_josephson_energy(
-    #         left_josephson_energy=self.dcsquid.left_josephson_energy,
-    #         right_josephson_energy=self.dcsquid.right_josephson_energy,
-    #         external_flux=external_flux
-    #     )
-        
-    #     H0 = sum(s.circuit.hamiltonian(external_flux[k]) for (k, s) in enumerate(self.upgraded_subsystems))
-    
     def upgrade(self, k: int, subsystem: SubSystem):
         n_truncated = subsystem.n.truncate(self.n_trunc)
         n_upgraded  = n_truncated.upgrade(

@@ -45,6 +45,7 @@ class Transmon(Circuit):
     def __init__(self, dcsquid: DCSQUID, shunt_capacitance: float, coupling_capacitance: float):
 
         self.dcsquid = dcsquid
+        self.gnd     = dcsquid.gnd
         self.island = self.dcsquid.island
                 
         self.shunt_capacitance    = shunt_capacitance
@@ -55,17 +56,28 @@ class Transmon(Circuit):
         # external drive enters through.
         shunt_capacitor = Capacitor(self.shunt_capacitance)
         coupling_capacitor = Capacitor(self.coupling_capacitance)
+        
+        self.branches = self.dcsquid.branches + [shunt_capacitor] + [coupling_capacitor]
 
         # Combined topology: the SQUID branches plus the two new shunt-
         # to-ground capacitors, all oriented ground -> island.
-        graph = Multidigraph(
+        self.source_dict   = {**self.dcsquid.source_dict, 
+                              shunt_capacitor: self.gnd, 
+                              coupling_capacitor: self.gnd
+                              }
+        self.terminal_dict = {**self.dcsquid.terminal_dict,
+                              shunt_capacitor: self.island,
+                              coupling_capacitor: self.island
+                              }
+        
+        self.graph = Multidigraph(
             nodes=dcsquid.nodes,
-            branches=dcsquid.branches + [shunt_capacitor] + [coupling_capacitor],
-            s=dcsquid.s + [self.dcsquid.gnd._id] * 2,
-            t=dcsquid.t + [self.dcsquid.island._id] * 2
+            branches=self.branches,
+            source_dict=self.source_dict,
+            terminal_dict=self.terminal_dict
         )
                 
-        super().__init__(graph)
+        super().__init__(self.graph)
         
     def hamiltonian(self, charging_energy: float, external_flux: float):
         EJ = DCSQUID.calculate_effective_josephson_energy(

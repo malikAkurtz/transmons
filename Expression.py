@@ -44,9 +44,6 @@ class Expression():
         elif isinstance(expression, Mul):
             a = Expression.realize(expression.a, n_charge)
             b = Expression.realize(expression.b, n_charge)
-            print("a")
-            print(a)
-            print(b)
             return a * b
             
         elif isinstance(expression, Pow):

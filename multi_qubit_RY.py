@@ -114,12 +114,34 @@ def main():
     
     cap_2c = Capacitor(capacitance=coup_capacitance_2c)
     
+    # ---- Create New Nodes List ----
+    nodes = [gnd, transmon_1.island, transmon_c.island, transmon_2.island]
+    
+    # ---- Create New Branches List ----
+    branches = transmon_1.branches + transmon_c.branches + transmon_2.branches + [cap_12, cap_1c, cap_2c]
+    
+    # ---- Create New Source and Terminal Dicts ----
+    source_dict = {**transmon_1.graph.source_dict, 
+                   **transmon_c.graph.source_dict,
+                   **transmon_2.graph.source_dict,
+                   cap_12: transmon_1.island,
+                   cap_1c: transmon_1.island,
+                   cap_2c: transmon_2.island
+                   }
+    terminal_dict = {**transmon_1.graph.terminal_dict, 
+                   **transmon_c.graph.terminal_dict,
+                   **transmon_2.graph.terminal_dict,
+                   cap_12: transmon_2.island,
+                   cap_1c: transmon_c.island,
+                   cap_2c: transmon_c.island
+                   }
+    
     # ---- Create Graph Representation ----
     graph = Multidigraph(
-        nodes=[gnd, transmon_1.island, transmon_c.island, transmon_2.island],
-        branches=transmon_1.branches + transmon_c.branches + transmon_2.branches + [cap_12, cap_1c, cap_2c],
-        s=transmon_1.s + transmon_c.s + transmon_2.s + [transmon_1.island._id, transmon_1.island._id, transmon_2.island._id],
-        t=transmon_1.t + transmon_c.t + transmon_2.t + [transmon_2.island._id, transmon_c.island._id, transmon_c.island._id],
+        nodes=nodes,
+        branches=branches,
+        source_dict=source_dict,
+        terminal_dict=terminal_dict,
     )
     
     # ---- Create Multi-Qubit Transmon Circuit ----
@@ -169,6 +191,10 @@ def main():
     # ---- Qubit Angular Frequencies ----
     print("Qubit Angular Frequencies")
     print(system.angular_frequencies)
+    
+    # ---- Logical Basis ----
+    print("Logical Basis")
+    print(system.logical_basis)
 
     # ---- Qubit Subsystem Index to Drive ----
     k = 0
