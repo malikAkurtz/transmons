@@ -10,7 +10,7 @@ writes a CSV lookup table that can be loaded in :mod:`main` instead.
 import numpy as np
 from scipy.linalg import expm
 from Matrices import PAULI_MATRICES
-
+from itertools import product
 
 def create_gaussian_sfq_pulses(num_kicks: int, amplitude_scale: float, driving_period: float, pulse_width: float, steps_per_period):
     r"""Generate a uniformly-sampled train of Gaussian SFQ-like pulses.
@@ -74,13 +74,36 @@ def create_gaussian_sfq_pulses(num_kicks: int, amplitude_scale: float, driving_p
 
     return np.array(time), np.array(voltage)
 
-def get_pauli_coefs(U_q: np.ndarray, basis: str):
-        if U_q[basis].shape != (2, 2):
-            raise Exception("Matrix is Not (2 x 2)")
-
-        coefs = np.zeros(len(PAULI_MATRICES), dtype=complex)
+def get_multi_qubit_paulis(num_qubits: int):
     
-        for idx, matrix in enumerate(PAULI_MATRICES):
-            coefs[idx] = np.trace(matrix @ U_q[basis]) / 2
-            
-        return coefs
+    # Create all possible tensor product combinations
+    full_basis = []
+    for p_combo in product(PAULI_MATRICES, repeat=num_qubits):
+        # Start with the first matrix in the combination
+        res = p_combo[0]
+        # Tensor it with the rest
+        for next_p in p_combo[1:]:
+            res = np.kron(res, next_p)
+        full_basis.append(res)
+        
+    return full_basis
+
+def get_pauli_coefs(U_q: np.ndarray):
+    """
+    U_q: The projected logical unitary matrix (2x2, 4x4, etc.)
+    """
+    d = U_q.shape[0]
+    num_qubits = int(np.log2(d))
+    
+    if 2**num_qubits != d:
+        raise ValueError(f"Matrix dimension {d} is not a power of 2.")
+
+    # Generate the 4^N basis matrices
+    pauli_basis = get_multi_qubit_paulis(num_qubits)
+    
+    coefs = np.zeros(len(pauli_basis), dtype=complex)
+
+    for idx, matrix in enumerate(pauli_basis):
+        coefs[idx] = np.trace(matrix @ U_q) / d
+        
+    return coefs

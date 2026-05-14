@@ -15,7 +15,6 @@ It is the output of :func:`Quantize.quantize_transmon` and the input to
 import numpy as np
 
 from Circuit import Circuit
-from DCSQUID import DCSQUID
 from Operator import Operator
 from constants import h
 
@@ -47,12 +46,13 @@ class System():
         Initialised to ``None`` and left to callers to populate.
     """
     def __init__(self, circuit: Circuit, subsystems: list[SubSystem], n_charge: int, n_trunc: int):
-        self.circuit    = circuit
-        self.subsystems = subsystems
-        self.n_charge   = n_charge
-        self.n_trunc    = n_trunc
-        self.n_full     = n_trunc**(len(self.subsystems))
-        self.state      = None
+        self.circuit        = circuit
+        self.subsystems     = subsystems # unperturbed
+        self.num_subsystems = len(self.subsystems)
+        self.n_charge       = n_charge
+        self.n_trunc        = n_trunc
+        self.n_full         = n_trunc**(len(self.subsystems))
+        self.state          = None
         
         # --- upgrade subsystems to full tensor product space ---
         self.upgraded_subsystems = [self.upgrade(i, s) for (i,s) in enumerate(self.subsystems)]
@@ -80,6 +80,10 @@ class System():
         )
         
         # --- diagonalize unperturbed/bare Hamiltonian ---
+        # NOTE: if there is only a single transmon, there is no coupling Hamiltonian
+        # so self.H0["energy"] is diagonal, and this step is trivial
+        # otherwise, HC is non-zero and adds off-diagonal terms
+        # to the unperturbed Hamiltonain
         self.energies, self.energy_states = np.linalg.eigh(self.H0["energy"])
         
         # --- construct logical basis ---
@@ -162,6 +166,8 @@ class System():
                 (E_01 - E_00) / h  # qubit 2 frequency
             ])
             self.angular_frequencies = 2 * np.pi * self.frequencies
+            
+        self.periods = 1 / self.frequencies
         
     def upgrade(self, k: int, subsystem: SubSystem):
         n_truncated = subsystem.n.truncate(self.n_trunc)
@@ -185,3 +191,46 @@ class System():
         )
         
         return upgraded_subsystem
+    
+    def set_coupler_flux(self, new_coupler_flux: float):
+        from Quantize import quantize
+        # ---- Re-Quantize the Coupler Transmon ----
+        new_coupler_subsystem = quantize(
+            circuit=self.subsystems[1].circuit,
+            charging_energy=self.circuit.charging_energy_matrix[1][1],
+            external_flux=new_coupler_flux,
+            n_charge=self.n_charge
+        )
+        
+        self.subsystems[1] = new_coupler_subsystem
+        
+        self.upgraded_subsystems[1] = self.upgrade(
+            k=1,
+            subsystem=self.subsystems[1]
+        )
+        
+        # --- Re-Compute Coupling Hamiltonian ---
+        HC = np.zeros((self.n_full, self.n_full))
+        
+        for k in range(len(self.subsystems)):
+            for l in range(len(self.subsystems)):
+                if k == l:
+                    continue
+                
+                HC += 4 * self.upgraded_subsystems[k].n["energy"] * self.circuit.charging_energy_matrix[k][l] \
+                    @ self.upgraded_subsystems[l].n["energy"]
+                    
+        self.HC = Operator(
+            basis_to_matrix={"energy": HC}
+        )
+                    
+        # --- Re-Compute Joint Unperturbed/Bare Hamiltonian ---
+        H0 = sum(s.H0["energy"] for s in self.upgraded_subsystems) + self.HC["energy"]
+
+        self.H0 = Operator(
+            basis_to_matrix={"energy": H0}
+        )
+        
+        # --- Diagonalize New Unperturbed/Bare Hamiltonian ---
+        self.energies, self.energy_states = np.linalg.eigh(self.H0["energy"])
+        

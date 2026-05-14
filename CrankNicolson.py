@@ -42,7 +42,7 @@ class CrankNicolsonSolver():
     def __init__(self):
         pass
 
-    def solve(self, system: System, initial_state: Wavefunction, external_voltage: np.ndarray, time: float, k: int):
+    def solve(self, system: System, initial_state: Wavefunction, external_voltages: np.ndarray, coupler_flux_schedule: np.ndarray, time: np.ndarray):
         r"""Evolve ``initial_state`` under ``H_0 + H_D(t)``.
 
         Parameters
@@ -80,29 +80,40 @@ class CrankNicolsonSolver():
         """
 
         n = len(initial_state["energy"])
-        num_steps = len(external_voltage)
+        num_steps = len(coupler_flux_schedule)
         dt = time[1] - time[0]
 
         state = initial_state
 
-        # Population of the |0>, |1>, |2> energy eigenstates at each step.
-        P0 = np.zeros(num_steps)
-        P1 = np.zeros(num_steps)
-        P2 = np.zeros(num_steps)
+        P0 = np.zeros(num_steps) # |00>
+        P1 = np.zeros(num_steps) # |01>
+        P2 = np.zeros(num_steps) # |10>
+        
+        current_coupler_flux = coupler_flux_schedule[0]
+        
+        n_vec = np.array([system.upgraded_subsystems[k].n["energy"] for k in range(system.num_subsystems)])
 
         for i in range(num_steps - 1):
-
-            # Mid-point voltage gives a second-order accurate evaluation
-            # of the time-dependent drive Hamiltonian on the interval.
-            voltage_midpoint = (external_voltage[i] + external_voltage[i+1]) / 2
-
-            n_e_k = system.subsystems[k].circuit.coupling_capacitance * voltage_midpoint / (2 * e)
-            
+            # ---- Re-Diagonalize if Coupler External Flux Changed ----
+            new_coupler_flux = coupler_flux_schedule[i]
+    
+            if new_coupler_flux != current_coupler_flux:
+                system.set_coupler_flux(new_coupler_flux)  # rebuild H0, HC, charge operators
+                current_coupler_flux = new_coupler_flux
+                
+            # ---- Build the Midpoint Driving Hamiltonian ---- 
             HD_midpoint = np.zeros((system.n_full, system.n_full))
-
-            for l in range(len(system.subsystems)):
-                HD_midpoint += -8 * n_e_k * system.circuit.charging_energy_matrix[k][l] * system.upgraded_subsystems[l].n["energy"]
-
+            
+            n_e_vec = np.zeros(len(system.subsystems))
+            
+            for k in range(system.num_subsystems):
+                v_midpoint = (external_voltages[k][i] + external_voltages[k][i+1]) / 2
+                n_e_vec[k] = (system.subsystems[k].circuit.coupling_capacitance * v_midpoint) / (2 * e)     
+            
+            for k in range(system.num_subsystems):
+                for l in range(system.num_subsystems):    
+                    HD_midpoint += n_e_vec[k] * system.circuit.charging_energy_matrix[k][l] * n_vec[l]
+            
             H = system.H0["energy"] + HD_midpoint
 
             # Cayley form of the propagator:
