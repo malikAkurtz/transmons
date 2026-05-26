@@ -74,6 +74,45 @@ def create_gaussian_sfq_pulses(num_kicks: int, amplitude_scale: float, driving_p
 
     return np.array(time), np.array(voltage)
 
+def cosine_ramp_schedule(num_steps: int,
+                         dt: float,
+                         t_start: float,
+                         t_rise: float,
+                         t_hold: float,
+                         off_value: float,
+                         on_value: float) -> np.ndarray:
+    r"""Build a raised-cosine OFF -> ON -> OFF schedule on a uniform grid.
+
+    The schedule is `off_value` everywhere except for an active window
+    starting at ``t_start``. Inside that window it ramps to ``on_value``
+    over ``t_rise``, holds for ``t_hold``, then ramps back over ``t_rise``.
+    The ramp uses the raised-cosine envelope ``0.5 * (1 - cos(pi * tau / t_rise))``,
+    which is C¹-smooth at both ends. Activity outside ``[0, num_steps * dt)``
+    is silently clipped.
+    """
+    schedule = np.full(num_steps, off_value, dtype=float)
+    amp = on_value - off_value
+
+    t_rise_up_end = t_start + t_rise
+    t_hold_end    = t_rise_up_end + t_hold
+    t_active_end  = t_hold_end + t_rise
+
+    for i in range(num_steps):
+        t = i * dt
+        if t < t_start or t >= t_active_end:
+            continue
+        if t < t_rise_up_end:
+            tau = t - t_start
+            schedule[i] = off_value + amp * 0.5 * (1 - np.cos(np.pi * tau / t_rise))
+        elif t < t_hold_end:
+            schedule[i] = on_value
+        else:
+            tau = t - t_hold_end
+            schedule[i] = on_value - amp * 0.5 * (1 - np.cos(np.pi * tau / t_rise))
+
+    return schedule
+
+
 def get_multi_qubit_paulis(num_qubits: int):
     
     # Create all possible tensor product combinations

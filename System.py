@@ -230,7 +230,3 @@ class System():
         self.H0 = Operator(
             basis_to_matrix={"energy": H0}
         )
-        
-        # --- Diagonalize New Unperturbed/Bare Hamiltonian ---
-        self.energies, self.energy_states = np.linalg.eigh(self.H0["energy"])
-        

@@ -57,6 +57,14 @@ def build_single_qubit():
 
 def build_multi_qubit():
     # ---- External Flux Threading JJ ----
+    # Coupler (index 1) flux tuned via scripts/sweep_coupler_flux.py:
+    #   OFF = 2.250 -> static ZZ ~ 84 kHz (idle, no conditional phase)
+    #   ON  = 2.670 -> static ZZ ~ 79 MHz, |11>-|20> gap = -382 MHz
+    # Old values were 0.352 (on) / 0.376 (off) at near-max coupler EJ, which
+    # left ~12 kHz residual XX and zero conditional-phase activation.
+    
+    # external_flux_on     = np.array([0.130, 2.670, 0.130]) * REDUCED_FLUX_QUANTUM
+    # external_flux_off    = np.array([0.130, 2.250, 0.130]) * REDUCED_FLUX_QUANTUM
     external_flux_on     = np.array([0.130, 0.352, 0.130]) * REDUCED_FLUX_QUANTUM
     external_flux_off    = np.array([0.130, 0.376, 0.130]) * REDUCED_FLUX_QUANTUM
     
