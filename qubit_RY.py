@@ -26,7 +26,7 @@ def main():
     n_trunc  = 7
     
     # ---- Initialize the Architecture (Single or Multi) ----
-    nodes, branches, source_dict, terminal_dict, transmons, external_flux_on, external_flux_off = build_multi_qubit()
+    nodes, branches, source_dict, terminal_dict, transmons, external_flux_on, external_flux_off = build_single_qubit()
 
     # ---- Create Master Graph Representation ----
     master_graph = Multidigraph(
@@ -45,12 +45,12 @@ def main():
     master_circuit.build()
     
     # ---- Extract SubCircuits ----
-    sub_circuits = [t.circuit for t in transmons]
+    sub_circuits = transmons
     
     # ---- Quantize Each Subcircuit to Produce Unperturbed Subsystems----
     subsystems = []
     
-    for i in range(len(transmons)):
+    for k in range(len(transmons)):
         subsystem = quantize(
             circuit=sub_circuits[k], 
             charging_energy=master_circuit.charging_energy_matrix[k][k],
@@ -62,7 +62,7 @@ def main():
     
     num_subsystems = len(subsystems)
     
-    # ---- Create the System from the Master Circuit and Subsystems----
+    # ---- Create the System from the Master Circuit and Subsystems ----
     system = System(
         circuit=master_circuit,
         subsystems=subsystems,
@@ -76,7 +76,7 @@ def main():
     # ---- Retrieve Charging Energies of Each Transmon Circuit ----
     charging_energies = np.array([master_circuit.charging_energy_matrix[k][k] for k in range(num_subsystems)])
     
-    # ---- Retrieve Idling Transmon Josephson Energies (From DCSQUID) ----
+    # ---- Retrieve Idling Transmon Josephson Energies (From DCSQUIDs) ----
     josephson_energies = np.array([DCSQUID.calculate_effective_josephson_energy(
         left_josephson_energy=t.dcsquid.left_josephson_energy,
         right_josephson_energy=t.dcsquid.right_josephson_energy,
@@ -140,14 +140,22 @@ def main():
     # ---- Save originals ----
     time_full = time.copy()
     voltage_full = external_voltage.copy()
+    
+    # ---- Build Larger External Voltage Schedule ----
+    external_voltages = [np.zeros(len(time_full)) for _ in range(num_subsystems)]
+    external_voltages[k] = voltage_full
+
+    # ---- Coupler Flux Schedule (idling) ----
+    coupler_flux_idx = 1 if num_subsystems > 1 else 0
+    coupler_flux_full = np.full(len(time_full), external_flux_off[coupler_flux_idx], dtype=float)
 
     # ---- First evolution (full) ----
     final_state, P0, P1, P2 = solver.solve(
         system=system,
         initial_state=ground_state.copy(),
-        external_voltage=voltage_full,
-        time=time_full,
-        k=k
+        external_voltage=external_voltages,
+        coupler_flux_schedule=coupler_flux_full,
+        time=time_full
     )
     
     plt.plot(time_full, P0, label='P0')
@@ -172,15 +180,16 @@ def main():
     # ---- Truncate from originals ----
     mask = time_full <= (rabi_half_period)
     time_half = time_full[mask]
-    voltage_half = voltage_full[mask]
+    external_voltages_half = [ev[mask] for ev in external_voltages]
+    coupler_flux_half = coupler_flux_full[mask]
 
     # ---- Second evolution (half Rabi) ----
     final_state, P0, P1, P2 = solver.solve(
         system=system,
         initial_state=ground_state.copy(),
-        external_voltage=voltage_half,
+        external_voltage=external_voltages_half,
+        coupler_flux_schedule=coupler_flux_half,
         time=time_half,
-        k=k
     )
     
     plt.clf()
@@ -196,47 +205,39 @@ def main():
     ground_evolved, _, _, _ = solver.solve(
         system=system,
         initial_state=ground_state.copy(),
-        external_voltage=voltage_half,
+        external_voltage=external_voltages_half,
+        coupler_flux_schedule=coupler_flux_half,
         time=time_half,
-        k=k
     )
 
     excited_evolved, _, _, _ = solver.solve(
         system=system,
         initial_state=excited_state.copy(),
-        external_voltage=voltage_half,
+        external_voltage=external_voltages_half,
+        coupler_flux_schedule=coupler_flux_half,
         time=time_half,
-        k=k
     )
     
     U[:, 0] = ground_evolved["energy"]
     U[:, 1] = excited_evolved["energy"]
     
-    # ---- Project U Onto the Logical/Computational Subspace of Qubit k----
+    # ---- Project U Onto the Logical/Computational Subspace ----
     U_q = Operator(basis_to_matrix={"energy": U[:2, :2]})
     
     # ---- Calculate Leakage and Fidelity Metrics ----
-    pauli_coefs = get_pauli_coefs(
-        U_q=U_q,
-        basis="energy"
-    )
+    pauli_coefs = get_pauli_coefs(U_q["energy"])
     
-    L1 = get_L1(
-        U_q=U_q,
-        basis="energy"
-    )
+    L1 = get_L1(U_q["energy"])
     
-    r = get_r(
-        coefs=pauli_coefs,
-    )
+    r = get_r(pauli_coefs)
     
     process_fidelity = get_process_fidelity(
-        U_q=U_q,
-        U_target=get_RY_target(theta_target=np.pi),
-        basis="energy"
+        U_q=U_q["energy"],
+        U_target=get_RY_target(np.pi)["energy"],
     )
 
     fidelity = get_average_gate_fidelity(
+        U_q=U_q["energy"],
         process_fidelity=process_fidelity,
         L1=L1
     )
@@ -244,8 +245,6 @@ def main():
     print("Gate Fidelity: ")
     print(fidelity)
     
-
-
 
 if __name__ == "__main__":
     main()

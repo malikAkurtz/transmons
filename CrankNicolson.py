@@ -42,7 +42,7 @@ class CrankNicolsonSolver():
     def __init__(self):
         pass
 
-    def solve(self, system: System, initial_state: Wavefunction, external_voltages: np.ndarray, coupler_flux_schedule: np.ndarray, time: np.ndarray):
+    def solve(self, system: System, initial_state: Wavefunction, external_voltage: np.ndarray, coupler_flux_schedule: np.ndarray, time: np.ndarray):
         r"""Evolve ``initial_state`` under ``H_0 + H_D(t)``.
 
         Parameters
@@ -107,12 +107,12 @@ class CrankNicolsonSolver():
             n_e_vec = np.zeros(len(system.subsystems))
             
             for k in range(system.num_subsystems):
-                v_midpoint = (external_voltages[k][i] + external_voltages[k][i+1]) / 2
+                v_midpoint = (external_voltage[k][i] + external_voltage[k][i+1]) / 2
                 n_e_vec[k] = (system.subsystems[k].circuit.coupling_capacitance * v_midpoint) / (2 * e)     
             
             for k in range(system.num_subsystems):
-                for l in range(system.num_subsystems):    
-                    HD_midpoint += n_e_vec[k] * system.circuit.charging_energy_matrix[k][l] * n_vec[l]
+                for l in range(system.num_subsystems):
+                    HD_midpoint += -8 * n_e_vec[k] * system.circuit.charging_energy_matrix[k][l] * n_vec[l]
             
             H = system.H0["energy"] + HD_midpoint
 
